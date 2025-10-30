@@ -810,9 +810,16 @@ struct Icon {
     pixels: Vec<u32>, // Stored as ARGB
 }
 
+#[derive(Clone)]
+enum IconSource {
+    Path(PathBuf),
+    Name(String),
+}
+
 struct IconTheme {
     cache: HashMap<String, Option<Icon>>,
     search_roots: Vec<PathBuf>,
+    desktop_index: Option<HashMap<String, Vec<IconSource>>>,
 }
 
 impl IconTheme {
@@ -820,6 +827,7 @@ impl IconTheme {
         Self {
             cache: HashMap::new(),
             search_roots: icon_search_roots(),
+            desktop_index: None,
         }
     }
 
@@ -837,7 +845,17 @@ impl IconTheme {
                 }
             }
 
-            let icon = self.load_icon(&key)?;
+            let mut icon = self.load_icon(&key)?;
+            if icon.is_none() {
+                if let Some(sources) = self.desktop_icon_sources(&key)? {
+                    for source in sources {
+                        icon = self.load_from_source(source)?;
+                        if icon.is_some() {
+                            break;
+                        }
+                    }
+                }
+            }
             self.cache.insert(key.clone(), icon.clone());
             if let Some(icon) = icon {
                 return Ok(Some(icon));
@@ -903,6 +921,21 @@ impl IconTheme {
             return Ok(None);
         }
         Ok(Some(scale_icon_to_limit(pixels, width, height)))
+    }
+
+    fn desktop_icon_sources(&mut self, key: &str) -> Result<Option<Vec<IconSource>>> {
+        if self.desktop_index.is_none() {
+            self.desktop_index = Some(build_desktop_index()?);
+        }
+        let index = self.desktop_index.as_ref().unwrap();
+        Ok(index.get(key).cloned())
+    }
+
+    fn load_from_source(&self, source: IconSource) -> Result<Option<Icon>> {
+        match source {
+            IconSource::Path(path) => self.decode_icon(&path),
+            IconSource::Name(name) => self.load_icon(&name),
+        }
     }
 }
 
@@ -1133,6 +1166,180 @@ fn parse_wm_icon(data: &[u32]) -> Option<Icon> {
     Some(scale_icon_to_limit(pixels, width, height))
 }
 
+fn build_desktop_index() -> Result<HashMap<String, Vec<IconSource>>> {
+    let mut map: HashMap<String, Vec<IconSource>> = HashMap::new();
+    for dir in desktop_entry_dirs() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()).map_or(true, |ext| ext != "desktop") {
+                continue;
+            }
+            if let Some((keys, source)) = parse_desktop_file(&path) {
+                for key in keys {
+                    map.entry(key).or_insert_with(Vec::new).push(source.clone());
+                }
+            }
+        }
+    }
+    Ok(map)
+}
+
+fn desktop_entry_dirs() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        let local_apps = home.join(".local").join("share").join("applications");
+        if local_apps.is_dir() {
+            dirs.push(local_apps);
+        }
+    }
+
+    if let Some(data_home) = env::var_os("XDG_DATA_HOME").map(PathBuf::from) {
+        let apps = data_home.join("applications");
+        if apps.is_dir() {
+            dirs.push(apps);
+        }
+    }
+
+    let data_dirs = env::var("XDG_DATA_DIRS")
+        .map(|dirs| dirs.split(':').map(PathBuf::from).collect::<Vec<_>>())
+        .unwrap_or_else(|_| vec![PathBuf::from("/usr/local/share"), PathBuf::from("/usr/share")]);
+    for dir in data_dirs {
+        let apps = dir.join("applications");
+        if apps.is_dir() {
+            dirs.push(apps);
+        }
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        let user_flatpak = PathBuf::from(&home)
+            .join(".local")
+            .join("share")
+            .join("flatpak")
+            .join("exports")
+            .join("share")
+            .join("applications");
+        if user_flatpak.is_dir() {
+            dirs.push(user_flatpak);
+        }
+    }
+
+    let global_flatpak = PathBuf::from("/var/lib/flatpak/exports/share/applications");
+    if global_flatpak.is_dir() {
+        dirs.push(global_flatpak);
+    }
+
+    dirs.sort();
+    dirs.dedup();
+    dirs
+}
+
+fn parse_desktop_file(path: &Path) -> Option<(Vec<String>, IconSource)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut in_entry = false;
+    let mut icon_value: Option<String> = None;
+    let mut name: Option<String> = None;
+    let mut startup_classes: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') {
+            in_entry = trimmed.eq_ignore_ascii_case("[Desktop Entry]");
+            continue;
+        }
+        if !in_entry || trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(value) = trimmed.strip_prefix("Icon=") {
+            if icon_value.is_none() {
+                icon_value = Some(value.trim().to_string());
+            }
+        } else if let Some(value) = trimmed.strip_prefix("Name=") {
+            if name.is_none() {
+                name = Some(value.trim().to_string());
+            }
+        } else if let Some(value) = trimmed.strip_prefix("StartupWMClass=") {
+            let entry = value.trim();
+            if !entry.is_empty() {
+                startup_classes.push(entry.to_string());
+            }
+        }
+    }
+
+    let icon_value = icon_value?;
+    let icon_source = if icon_value.starts_with('/') {
+        IconSource::Path(PathBuf::from(icon_value))
+    } else if icon_value.contains('/') {
+        let base = path.parent().unwrap_or_else(|| Path::new(""));
+        IconSource::Path(base.join(icon_value))
+    } else {
+        IconSource::Name(icon_value.to_lowercase())
+    };
+
+    let mut keys = HashSet::new();
+    if let Some(name) = name {
+        let lower = name.to_lowercase();
+        if !lower.is_empty() {
+            keys.insert(lower.clone());
+            for part in lower.split_whitespace() {
+                if !part.is_empty() {
+                    keys.insert(part.to_string());
+                }
+            }
+        }
+    }
+    for class in startup_classes {
+        let lower = class.to_lowercase();
+        if !lower.is_empty() {
+            keys.insert(lower);
+        }
+    }
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        let lower = stem.to_lowercase();
+        keys.insert(lower.clone());
+        for part in lower.split('.') {
+            if !part.is_empty() {
+                keys.insert(part.to_string());
+            }
+        }
+    }
+    match &icon_source {
+        IconSource::Path(p) => {
+            if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
+                let lower = stem.to_lowercase();
+                keys.insert(lower.clone());
+                for part in lower.split('-') {
+                    if !part.is_empty() {
+                        keys.insert(part.to_string());
+                    }
+                }
+            }
+        }
+        IconSource::Name(name) => {
+            if !name.is_empty() {
+                keys.insert(name.clone());
+                for part in name.split('-') {
+                    if !part.is_empty() {
+                        keys.insert(part.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if keys.is_empty() {
+        return None;
+    }
+
+    let mut key_list: Vec<String> = keys.into_iter().collect();
+    key_list.sort();
+    Some((key_list, icon_source))
+}
+
 fn icon_search_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     if let Some(home) = env::var_os("HOME") {
@@ -1222,7 +1429,10 @@ fn icon_file_matches(path: &Path, names: &[String]) -> bool {
         None => return false,
     };
 
-    names.iter().any(|name| stem == name.as_str() || stem.starts_with(name.as_str()))
+    names.iter().any(|name| {
+        let candidate = name.as_str();
+        stem == candidate || stem.starts_with(candidate)
+    })
 }
 
 fn scale_icon_to_limit(pixels: Vec<u32>, width: usize, height: usize) -> Icon {
