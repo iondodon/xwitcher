@@ -1,4 +1,4 @@
-use std::cmp::{max, min};
+use std::cmp::{max, min, Ordering};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,8 @@ use x11rb::{
         xproto::{
             Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent,
             EventMask, Gcontext, GrabMode, ImageFormat, ImageOrder, KeyButMask, KeyPressEvent,
-            KeyReleaseEvent, Keycode, MapState, ModMask, PropMode, Rectangle, Window, WindowClass,
+            KeyReleaseEvent, Keycode, MapState, ModMask, PropMode, PropertyNotifyEvent, Rectangle,
+            Window, WindowClass,
         },
         Event,
     },
@@ -83,19 +84,23 @@ struct AltTab {
     bindings: KeyBindings,
     state: Option<OverlayState>,
     icon_theme: IconTheme,
+    mru: Vec<Window>,
 }
 
 impl AltTab {
     fn new(conn: RustConnection, screen_num: usize, atoms: Atoms) -> Result<Self> {
         let bindings = KeyBindings::load(&conn)?;
-        let app = Self {
+        let mut app = Self {
             conn,
             screen_num,
             atoms,
             bindings,
             state: None,
             icon_theme: IconTheme::new(),
+            mru: Vec::new(),
         };
+        app.register_root_events()?;
+        app.refresh_active_window()?;
         app.grab_tab_keys()?;
         Ok(app)
     }
@@ -126,6 +131,7 @@ impl AltTab {
                         }
                     }
                 }
+                Event::PropertyNotify(event) => self.handle_property_notify(event)?,
                 _ => {}
             }
         }
@@ -189,6 +195,57 @@ impl AltTab {
         Ok(())
     }
 
+    fn register_root_events(&self) -> Result<()> {
+        let root = self.screen().root;
+        self.conn.change_window_attributes(
+            root,
+            &ChangeWindowAttributesAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )?;
+        Ok(())
+    }
+
+    fn refresh_active_window(&mut self) -> Result<()> {
+        if let Some(window) = self.get_active_window()? {
+            self.update_mru(window);
+        }
+        Ok(())
+    }
+
+    fn update_mru(&mut self, window: Window) {
+        if window == 0 {
+            return;
+        }
+        if let Some(state) = &self.state {
+            if window == state.overlay.window {
+                return;
+            }
+        }
+        self.mru.retain(|w| *w != window);
+        self.mru.insert(0, window);
+    }
+
+    fn apply_mru_order(&self, entries: &mut Vec<WindowEntry>) {
+        entries.sort_by(|a, b| {
+            let ra = self.mru.iter().position(|w| *w == a.window);
+            let rb = self.mru.iter().position(|w| *w == b.window);
+            match (ra, rb) {
+                (Some(ra), Some(rb)) => ra.cmp(&rb),
+                (Some(_), None) => Ordering::Less,
+                (None, Some(_)) => Ordering::Greater,
+                (None, None) => Ordering::Equal,
+            }
+        });
+    }
+
+    fn handle_property_notify(&mut self, event: PropertyNotifyEvent) -> Result<()> {
+        if event.atom == self.atoms._NET_ACTIVE_WINDOW {
+            if let Some(window) = self.get_active_window()? {
+                self.update_mru(window);
+            }
+        }
+        Ok(())
+    }
+
     fn start_overlay(&mut self, direction: Direction) -> Result<()> {
         if self.state.is_some() {
             return Ok(());
@@ -238,6 +295,7 @@ impl AltTab {
             if accept {
                 if let Some(target) = state.selected_window() {
                     self.focus_window(target)?;
+                    self.update_mru(target);
                 }
             }
             self.conn.flush()?;
@@ -554,6 +612,7 @@ impl AltTab {
             }
             result.push(WindowEntry { window, title, icon });
         }
+        self.apply_mru_order(&mut result);
         Ok(result)
     }
 
@@ -1190,8 +1249,8 @@ fn build_desktop_index() -> Result<HashMap<String, Vec<IconSource>>> {
 
 fn desktop_entry_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
-    if let Some(home) = env::var_os("HOME") {
-        let home = PathBuf::from(home);
+    if let Some(home_os) = env::var_os("HOME") {
+        let home = PathBuf::from(&home_os);
         let local_apps = home.join(".local").join("share").join("applications");
         if local_apps.is_dir() {
             dirs.push(local_apps);
@@ -1215,8 +1274,9 @@ fn desktop_entry_dirs() -> Vec<PathBuf> {
         }
     }
 
-    if let Some(home) = env::var_os("HOME") {
-        let user_flatpak = PathBuf::from(&home)
+    if let Some(home_os) = env::var_os("HOME") {
+        let home = PathBuf::from(home_os);
+        let user_flatpak = home
             .join(".local")
             .join("share")
             .join("flatpak")
