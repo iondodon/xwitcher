@@ -1,5 +1,7 @@
 use std::cmp::{max, min};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::env;
+use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
 use x11::{
@@ -32,6 +34,7 @@ const ICON_MARGIN: u16 = 8;
 const ICON_AREA: u16 = ICON_MAX_SIZE + ICON_MARGIN * 2;
 const TEXT_OFFSET: i16 = ICON_AREA as i16 + 8;
 const TEXT_BASELINE: i16 = 34;
+const MAX_ICON_SEARCH_DEPTH: u8 = 5;
 
 #[allow(non_snake_case)]
 struct Atoms {
@@ -79,6 +82,7 @@ struct AltTab {
     atoms: Atoms,
     bindings: KeyBindings,
     state: Option<OverlayState>,
+    icon_theme: IconTheme,
 }
 
 impl AltTab {
@@ -90,6 +94,7 @@ impl AltTab {
             atoms,
             bindings,
             state: None,
+            icon_theme: IconTheme::new(),
         };
         app.grab_tab_keys()?;
         Ok(app)
@@ -508,7 +513,7 @@ impl AltTab {
         Ok(gc)
     }
 
-    fn collect_windows(&self) -> Result<Vec<WindowEntry>> {
+    fn collect_windows(&mut self) -> Result<Vec<WindowEntry>> {
         let root = self.screen().root;
         let mut windows = self
             .get_property_window_list(root, self.atoms._NET_CLIENT_LIST_STACKING)?
@@ -542,7 +547,11 @@ impl AltTab {
             }
 
             let title = self.window_title(window)?;
-            let icon = self.window_icon(window)?;
+            let mut icon = self.window_icon(window)?;
+            if icon.is_none() {
+                let class_names = self.window_class_names(window)?;
+                icon = self.icon_theme.lookup(&class_names)?;
+            }
             result.push(WindowEntry { window, title, icon });
         }
         Ok(result)
@@ -603,6 +612,40 @@ impl AltTab {
         }
 
         Ok(format!("0x{:x}", window))
+    }
+
+    fn window_class_names(&self, window: Window) -> Result<Vec<String>> {
+        let cookie = self.conn.get_property(
+            false,
+            window,
+            self.atoms.WM_CLASS,
+            x11rb::protocol::xproto::AtomEnum::STRING,
+            0,
+            64,
+        )?;
+        let reply = match cookie.reply() {
+            Ok(rep) => rep,
+            Err(_) => return Ok(Vec::new()),
+        };
+        if reply.value.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut names = HashSet::new();
+        for part in reply.value.split(|b| *b == 0) {
+            if part.is_empty() {
+                continue;
+            }
+            let text = String::from_utf8_lossy(part).trim().to_string();
+            if text.is_empty() {
+                continue;
+            }
+            names.insert(text.clone());
+            names.insert(text.to_lowercase());
+            names.insert(text.replace(' ', "-").to_lowercase());
+        }
+
+        Ok(names.into_iter().collect())
     }
 
     fn window_icon(&self, window: Window) -> Result<Option<Icon>> {
@@ -765,6 +808,102 @@ struct Icon {
     width: u16,
     height: u16,
     pixels: Vec<u32>, // Stored as ARGB
+}
+
+struct IconTheme {
+    cache: HashMap<String, Option<Icon>>,
+    search_roots: Vec<PathBuf>,
+}
+
+impl IconTheme {
+    fn new() -> Self {
+        Self {
+            cache: HashMap::new(),
+            search_roots: icon_search_roots(),
+        }
+    }
+
+    fn lookup(&mut self, names: &[String]) -> Result<Option<Icon>> {
+        for name in names {
+            if name.is_empty() {
+                continue;
+            }
+            let key = name.to_lowercase();
+            if let Some(cached) = self.cache.get(&key) {
+                if let Some(icon) = cached {
+                    return Ok(Some(icon.clone()));
+                } else {
+                    continue;
+                }
+            }
+
+            let icon = self.load_icon(&key)?;
+            self.cache.insert(key.clone(), icon.clone());
+            if let Some(icon) = icon {
+                return Ok(Some(icon));
+            }
+        }
+        Ok(None)
+    }
+
+    fn load_icon(&self, name: &str) -> Result<Option<Icon>> {
+        let mut variants = Vec::new();
+        variants.push(name.to_string());
+        if let Some(last) = name.rsplit('.').next() {
+            if last != name {
+                variants.push(last.to_string());
+            }
+        }
+        if name.contains('-') {
+            variants.push(name.replace('-', ""));
+        }
+        if name.contains('_') {
+            variants.push(name.replace('_', "-"));
+        }
+        variants.sort();
+        variants.dedup();
+
+        let path = self.find_icon_path(&variants);
+        match path {
+            Some(path) => self.decode_icon(&path),
+            None => Ok(None),
+        }
+    }
+
+    fn find_icon_path(&self, names: &[String]) -> Option<PathBuf> {
+        if names.is_empty() {
+            return None;
+        }
+        let lowered: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+        for root in &self.search_roots {
+            if let Some(found) = search_directory(root, &lowered, 0) {
+                return Some(found);
+            }
+        }
+        None
+    }
+
+    fn decode_icon(&self, path: &Path) -> Result<Option<Icon>> {
+        let img = match image::open(path) {
+            Ok(img) => img,
+            Err(_) => return Ok(None),
+        };
+        let rgba = img.to_rgba8();
+        let (width, height) = (rgba.width() as usize, rgba.height() as usize);
+        let mut pixels = Vec::with_capacity(width * height);
+        for chunk in rgba.chunks_exact(4) {
+            pixels.push(
+                (u32::from(chunk[3]) << 24)
+                    | (u32::from(chunk[0]) << 16)
+                    | (u32::from(chunk[1]) << 8)
+                    | u32::from(chunk[2]),
+            );
+        }
+        if !icon_has_visible_pixels(&pixels) {
+            return Ok(None);
+        }
+        Ok(Some(scale_icon_to_limit(pixels, width, height)))
+    }
 }
 
 struct WindowEntry {
@@ -994,6 +1133,98 @@ fn parse_wm_icon(data: &[u32]) -> Option<Icon> {
     Some(scale_icon_to_limit(pixels, width, height))
 }
 
+fn icon_search_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Some(home) = env::var_os("HOME") {
+        let home = PathBuf::from(home);
+        let hidden_icons = home.join(".icons");
+        if hidden_icons.is_dir() {
+            roots.push(hidden_icons);
+        }
+        let local_share = home.join(".local").join("share").join("icons");
+        if local_share.is_dir() {
+            roots.push(local_share);
+        }
+    }
+
+    let data_home = env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .map(PathBuf::from)
+                .map(|home| home.join(".local").join("share"))
+        });
+    if let Some(dir) = data_home {
+        let icons_dir = dir.join("icons");
+        if icons_dir.is_dir() {
+            roots.push(icons_dir);
+        }
+    }
+
+    let data_dirs = env::var("XDG_DATA_DIRS")
+        .map(|dirs| dirs.split(':').map(PathBuf::from).collect::<Vec<_>>())
+        .unwrap_or_else(|_| vec![PathBuf::from("/usr/local/share"), PathBuf::from("/usr/share")]);
+    for dir in data_dirs {
+        let icons_dir = dir.join("icons");
+        if icons_dir.is_dir() {
+            roots.push(icons_dir);
+        }
+    }
+
+    let pixmaps = PathBuf::from("/usr/share/pixmaps");
+    if pixmaps.is_dir() {
+        roots.push(pixmaps);
+    }
+
+    roots
+}
+
+fn search_directory(dir: &Path, names: &[String], depth: u8) -> Option<PathBuf> {
+    if depth > MAX_ICON_SEARCH_DEPTH {
+        return None;
+    }
+
+    if !dir.exists() {
+        return None;
+    }
+
+    if dir.is_file() && icon_file_matches(dir, names) {
+        return Some(dir.to_path_buf());
+    }
+
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = search_directory(&path, names, depth + 1) {
+                return Some(found);
+            }
+        } else if path.is_file() && icon_file_matches(&path, names) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn icon_file_matches(path: &Path, names: &[String]) -> bool {
+    let extension = match path.extension().and_then(|ext| ext.to_str()) {
+        Some(ext) => ext.to_lowercase(),
+        None => return false,
+    };
+
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
+        return false;
+    }
+
+    let stem = match path.file_stem().and_then(|stem| stem.to_str()) {
+        Some(stem) => stem.to_lowercase(),
+        None => return false,
+    };
+
+    names.iter().any(|name| stem == name.as_str() || stem.starts_with(name.as_str()))
+}
+
 fn scale_icon_to_limit(pixels: Vec<u32>, width: usize, height: usize) -> Icon {
     if width == 0 || height == 0 {
         return Icon {
@@ -1038,4 +1269,12 @@ fn scale_icon_to_limit(pixels: Vec<u32>, width: usize, height: usize) -> Icon {
         height: new_height as u16,
         pixels: scaled,
     }
+}
+
+fn icon_has_visible_pixels(pixels: &[u32]) -> bool {
+    pixels.iter().any(|&pixel| {
+        let alpha = (pixel >> 24) & 0xff;
+        let rgb = pixel & 0x00ff_ffff;
+        alpha != 0 || rgb != 0
+    })
 }

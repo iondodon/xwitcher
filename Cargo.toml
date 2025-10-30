@@ -7,3 +7,4 @@ edition = "2024"
 x11rb = "0.13"
 x11 = "2"
 anyhow = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
