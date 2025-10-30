@@ -13,9 +13,9 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{
     protocol::{
         xproto::{
-            Atom, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent, EventMask,
-            Gcontext, GrabMode, KeyButMask, KeyPressEvent, KeyReleaseEvent, Keycode, MapState,
-            ModMask, PropMode, Rectangle, Window, WindowClass,
+            Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent,
+            EventMask, Gcontext, GrabMode, ImageFormat, ImageOrder, KeyButMask, KeyPressEvent,
+            KeyReleaseEvent, Keycode, MapState, ModMask, PropMode, Rectangle, Window, WindowClass,
         },
         Event,
     },
@@ -24,10 +24,14 @@ use x11rb::{
 };
 
 const OVERLAY_WIDTH: u16 = 600;
-const ROW_HEIGHT: u16 = 32;
+const ROW_HEIGHT: u16 = 56;
 const PADDING: u16 = 16;
 const SCREEN_MARGIN: u16 = 96;
-const TEXT_BASELINE: i16 = 22;
+const ICON_MAX_SIZE: u16 = 40;
+const ICON_MARGIN: u16 = 8;
+const ICON_AREA: u16 = ICON_MAX_SIZE + ICON_MARGIN * 2;
+const TEXT_OFFSET: i16 = ICON_AREA as i16 + 8;
+const TEXT_BASELINE: i16 = 34;
 
 #[allow(non_snake_case)]
 struct Atoms {
@@ -38,6 +42,7 @@ struct Atoms {
     _NET_WM_VISIBLE_NAME: Atom,
     _NET_WM_WINDOW_TYPE: Atom,
     _NET_WM_WINDOW_TYPE_NOTIFICATION: Atom,
+    _NET_WM_ICON: Atom,
     UTF8_STRING: Atom,
     WM_CLASS: Atom,
     WM_NAME: Atom,
@@ -53,6 +58,7 @@ impl Atoms {
             _NET_WM_VISIBLE_NAME: intern_atom(conn, "_NET_WM_VISIBLE_NAME")?,
             _NET_WM_WINDOW_TYPE: intern_atom(conn, "_NET_WM_WINDOW_TYPE")?,
             _NET_WM_WINDOW_TYPE_NOTIFICATION: intern_atom(conn, "_NET_WM_WINDOW_TYPE_NOTIFICATION")?,
+            _NET_WM_ICON: intern_atom(conn, "_NET_WM_ICON")?,
             UTF8_STRING: intern_atom(conn, "UTF8_STRING")?,
             WM_CLASS: intern_atom(conn, "WM_CLASS")?,
             WM_NAME: intern_atom(conn, "WM_NAME")?,
@@ -259,28 +265,35 @@ impl AltTab {
                 height: ROW_HEIGHT,
             };
 
-            if window_index == state.current {
+            let is_selected = window_index == state.current;
+            if is_selected {
                 self.conn.poly_fill_rectangle(
                     state.overlay.window,
                     state.overlay.highlight_gc,
                     &[rect],
                 )?;
-                self.draw_text(
-                    state.overlay.window,
-                    state.overlay.selected_text_gc,
-                    rect.x + 8,
-                    rect.y + TEXT_BASELINE,
-                    &entry.title,
-                )?;
-            } else {
-                self.draw_text(
-                    state.overlay.window,
-                    state.overlay.text_gc,
-                    rect.x + 8,
-                    rect.y + TEXT_BASELINE,
-                    &entry.title,
-                )?;
             }
+
+            if let Some(icon) = &entry.icon {
+                let icon_x = rect.x + ICON_MARGIN as i16;
+                let icon_y = rect.y
+                    + ((ROW_HEIGHT as i16 - icon.height as i16) / 2).max(0);
+                self.draw_icon(&state.overlay, icon, icon_x, icon_y, is_selected)?;
+            }
+
+            let gc = if is_selected {
+                state.overlay.selected_text_gc
+            } else {
+                state.overlay.text_gc
+            };
+
+            self.draw_text(
+                state.overlay.window,
+                gc,
+                rect.x + TEXT_OFFSET,
+                rect.y + TEXT_BASELINE,
+                &entry.title,
+            )?;
         }
         self.conn.flush()?;
         Ok(())
@@ -307,10 +320,103 @@ impl AltTab {
         Ok(())
     }
 
+    fn draw_icon(
+        &self,
+        overlay: &OverlayWindow,
+        icon: &Icon,
+        x: i16,
+        y: i16,
+        selected: bool,
+    ) -> Result<()> {
+        if icon.pixels.is_empty() {
+            return Ok(());
+        }
+
+        let width = icon.width;
+        let height = icon.height;
+        let little_endian = matches!(
+            self.conn.setup().image_byte_order,
+            ImageOrder::LSB_FIRST
+        );
+        let depth = self.screen().root_depth;
+        let format = self
+            .conn
+            .setup()
+            .pixmap_formats
+            .iter()
+            .find(|fmt| fmt.depth == depth)
+            .with_context(|| format!("missing pixmap format for depth {depth}"))?;
+
+        let bytes_per_pixel = usize::from(format.bits_per_pixel / 8);
+        let pad = usize::from(format.scanline_pad / 8).max(1);
+        let row_stride = ((width as usize * bytes_per_pixel + pad - 1) / pad) * pad;
+        let mut data = vec![0u8; row_stride * height as usize];
+
+        let bg = if selected { 0xFFFFFF } else { 0x000000 };
+        let bg_r = ((bg >> 16) & 0xff) as u32;
+        let bg_g = ((bg >> 8) & 0xff) as u32;
+        let bg_b = (bg & 0xff) as u32;
+
+        for row in 0..height as usize {
+            for col in 0..width as usize {
+                let pixel = icon.pixels[row * width as usize + col];
+                let alpha = ((pixel >> 24) & 0xff) as u32;
+                let inv_alpha = 255 - alpha;
+
+                let src_r = ((pixel >> 16) & 0xff) as u32;
+                let src_g = ((pixel >> 8) & 0xff) as u32;
+                let src_b = (pixel & 0xff) as u32;
+
+                let out_r = ((src_r * alpha + bg_r * inv_alpha + 127) / 255) as u8;
+                let out_g = ((src_g * alpha + bg_g * inv_alpha + 127) / 255) as u8;
+                let out_b = ((src_b * alpha + bg_b * inv_alpha + 127) / 255) as u8;
+
+                let offset = row * row_stride + col * bytes_per_pixel;
+                if little_endian {
+                    data[offset] = out_b;
+                    if bytes_per_pixel > 1 {
+                        data[offset + 1] = out_g;
+                    }
+                    if bytes_per_pixel > 2 {
+                        data[offset + 2] = out_r;
+                    }
+                    if bytes_per_pixel > 3 {
+                        data[offset + 3] = 0;
+                    }
+                } else {
+                    let base = offset + bytes_per_pixel.saturating_sub(3);
+                    data[base] = out_r;
+                    if bytes_per_pixel > 1 {
+                        data[base + 1] = out_g;
+                    }
+                    if bytes_per_pixel > 2 {
+                        data[base + 2] = out_b;
+                    }
+                }
+            }
+        }
+
+        self.conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            overlay.window,
+            overlay.icon_gc,
+            width,
+            height,
+            x,
+            y,
+            0,
+            depth,
+            &data,
+        )?;
+
+        Ok(())
+    }
+
     fn destroy_overlay(&self, overlay: &OverlayWindow) -> Result<()> {
         let _ = self.conn.free_gc(overlay.text_gc);
         let _ = self.conn.free_gc(overlay.selected_text_gc);
         let _ = self.conn.free_gc(overlay.highlight_gc);
+        let _ = self.conn.free_gc(overlay.icon_gc);
         let _ = self.conn.unmap_window(overlay.window);
         let _ = self.conn.destroy_window(overlay.window);
         Ok(())
@@ -379,12 +485,14 @@ impl AltTab {
         let text_gc = self.create_gc(window, screen.white_pixel, screen.black_pixel)?;
         let selected_text_gc = self.create_gc(window, screen.black_pixel, screen.white_pixel)?;
         let highlight_gc = self.create_gc(window, screen.white_pixel, screen.white_pixel)?;
+        let icon_gc = self.create_gc(window, screen.white_pixel, screen.black_pixel)?;
 
         Ok(OverlayWindow {
             window,
             text_gc,
             selected_text_gc,
             highlight_gc,
+            icon_gc,
             width,
             height,
             visible_rows,
@@ -434,7 +542,8 @@ impl AltTab {
             }
 
             let title = self.window_title(window)?;
-            result.push(WindowEntry { window, title });
+            let icon = self.window_icon(window)?;
+            result.push(WindowEntry { window, title, icon });
         }
         Ok(result)
     }
@@ -494,6 +603,33 @@ impl AltTab {
         }
 
         Ok(format!("0x{:x}", window))
+    }
+
+    fn window_icon(&self, window: Window) -> Result<Option<Icon>> {
+        let cookie = self.conn.get_property(
+            false,
+            window,
+            self.atoms._NET_WM_ICON,
+            AtomEnum::CARDINAL,
+            0,
+            u32::MAX,
+        )?;
+
+        let reply = match cookie.reply() {
+            Ok(rep) => rep,
+            Err(_) => return Ok(None),
+        };
+
+        let values: Vec<u32> = match reply.value32() {
+            Some(iter) => iter.collect(),
+            None => return Ok(None),
+        };
+
+        if values.len() < 3 {
+            return Ok(None);
+        }
+
+        Ok(parse_wm_icon(&values))
     }
 
     fn get_utf8_property(&self, window: Window, atom: u32) -> Result<Option<String>> {
@@ -625,9 +761,16 @@ impl AltTab {
 }
 
 #[derive(Debug, Clone)]
+struct Icon {
+    width: u16,
+    height: u16,
+    pixels: Vec<u32>, // Stored as ARGB
+}
+
 struct WindowEntry {
     window: Window,
     title: String,
+    icon: Option<Icon>,
 }
 
 struct OverlayWindow {
@@ -635,6 +778,7 @@ struct OverlayWindow {
     text_gc: Gcontext,
     selected_text_gc: Gcontext,
     highlight_gc: Gcontext,
+    icon_gc: Gcontext,
     width: u16,
     height: u16,
     visible_rows: usize,
@@ -794,4 +938,104 @@ fn intern_atom(conn: &RustConnection, name: &str) -> Result<Atom> {
         .reply()
         .with_context(|| format!("failed to intern atom {name}"))?;
     Ok(reply.atom)
+}
+
+fn parse_wm_icon(data: &[u32]) -> Option<Icon> {
+    let target = ICON_MAX_SIZE as usize;
+    let mut best: Option<(usize, usize, Vec<u32>)> = None;
+    let mut fallback: Option<(usize, usize, Vec<u32>)> = None;
+
+    let mut idx = 0;
+    while idx + 2 <= data.len() {
+        let width = data[idx] as usize;
+        let height = data[idx + 1] as usize;
+        idx += 2;
+
+        if width == 0 || height == 0 {
+            continue;
+        }
+
+        let len = match width.checked_mul(height) {
+            Some(len) => len,
+            None => break,
+        };
+        if idx + len > data.len() {
+            break;
+        }
+
+        let pixels = data[idx..idx + len].to_vec();
+        idx += len;
+
+        let max_dim = width.max(height);
+        if width <= target && height <= target {
+            let best_dim = best
+                .as_ref()
+                .map(|(w, h, _)| (*w).max(*h))
+                .unwrap_or(0);
+            if max_dim > best_dim {
+                best = Some((width, height, pixels));
+            }
+        } else {
+            if let Some((fw, fh, _)) = &fallback {
+                if (*fw).max(*fh) <= max_dim {
+                    continue;
+                }
+            }
+            fallback = Some((width, height, pixels));
+        }
+    }
+
+    let (width, height, pixels) = if let Some(best) = best {
+        best
+    } else {
+        fallback?
+    };
+
+    Some(scale_icon_to_limit(pixels, width, height))
+}
+
+fn scale_icon_to_limit(pixels: Vec<u32>, width: usize, height: usize) -> Icon {
+    if width == 0 || height == 0 {
+        return Icon {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        };
+    }
+
+    let target = ICON_MAX_SIZE as usize;
+    if width <= target && height <= target {
+        return Icon {
+            width: width as u16,
+            height: height as u16,
+            pixels,
+        };
+    }
+
+    let max_dim = width.max(height);
+    if max_dim == 0 {
+        return Icon {
+            width: 0,
+            height: 0,
+            pixels: Vec::new(),
+        };
+    }
+
+    let new_width = ((width * target + max_dim / 2) / max_dim).max(1);
+    let new_height = ((height * target + max_dim / 2) / max_dim).max(1);
+    let mut scaled = vec![0u32; new_width * new_height];
+
+    for y in 0..new_height {
+        let src_y = y * height / new_height;
+        for x in 0..new_width {
+            let src_x = x * width / new_width;
+            scaled[y * new_width + x] = pixels[src_y * width + src_x];
+        }
+    }
+
+    Icon {
+        width: new_width as u16,
+        height: new_height as u16,
+        pixels: scaled,
+    }
 }
