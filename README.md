@@ -24,12 +24,18 @@ cargo build --release
 
 The optimized binary will be at `target/release/xwitcher`.
 
+## Installing 
+
+```bash
+cargo install --path .
+```
+
 ## Running
 
 Launch the binary inside your X session:
 
 ```bash
-target/release/xwitcher &
+xwitcher &
 ```
 
 The process grabs the keyboard when `Alt`+`Tab` is pressed and keeps running in the background. Press `Ctrl+C` in the launching terminal or kill the process to stop it.
