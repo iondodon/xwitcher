@@ -1,8 +1,8 @@
-use anyhow::bail;
 use anyhow::{Context, Result};
 use std::cmp::{Ordering, max, min};
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use x11::keysym::{XK_Alt_L, XK_Alt_R, XK_Escape, XK_Tab};
@@ -23,21 +23,21 @@ use x11rb::{
     rust_connection::RustConnection,
 };
 
-const OVERLAY_WIDTH: u16 = 600;
-const ROW_HEIGHT: u16 = 56;
-const PADDING: u16 = 16;
-const SCREEN_MARGIN: u16 = 96;
-const ICON_MAX_SIZE: u16 = 40;
-const ICON_MARGIN: u16 = 8;
-const ICON_AREA: u16 = ICON_MAX_SIZE + ICON_MARGIN * 2;
-const TEXT_OFFSET: i16 = ICON_AREA as i16 + 8;
-const TEXT_BASELINE: i16 = 34;
 const MAX_ICON_SEARCH_DEPTH: u8 = 5;
-const H_ITEM_WIDTH: u16 = 120;
-const H_ITEM_HEIGHT: u16 = ICON_AREA + 36;
-const H_TEXT_OFFSET: i16 = 8;
-const H_TEXT_BASELINE: i16 = ICON_AREA as i16 + 26;
-const H_CHAR_WIDTH_ESTIMATE: u16 = 7;
+
+const DEFAULT_OVERLAY_WIDTH: u16 = 600;
+const DEFAULT_ROW_HEIGHT: u16 = 56;
+const DEFAULT_PADDING: u16 = 16;
+const DEFAULT_SCREEN_MARGIN: u16 = 96;
+const DEFAULT_ICON_MAX_SIZE: u16 = 40;
+const DEFAULT_ICON_MARGIN: u16 = 8;
+const DEFAULT_VERTICAL_TEXT_GAP: i16 = 8;
+const DEFAULT_VERTICAL_TEXT_BASELINE: i16 = 34;
+const DEFAULT_HORIZONTAL_ITEM_WIDTH: u16 = 120;
+const DEFAULT_HORIZONTAL_ITEM_HEIGHT: u16 = 92;
+const DEFAULT_HORIZONTAL_TEXT_OFFSET: i16 = 8;
+const DEFAULT_HORIZONTAL_TEXT_BASELINE: i16 = 82;
+const DEFAULT_HORIZONTAL_CHAR_WIDTH: u16 = 7;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum Layout {
@@ -51,53 +51,472 @@ impl Default for Layout {
     }
 }
 
-fn parse_layout<I>(args: I) -> Result<Layout>
+struct CliOptions {
+    layout: Layout,
+}
+
+fn parse_cli_options<I>(args: I) -> Result<CliOptions>
 where
     I: IntoIterator<Item = String>,
 {
     let mut layout = Layout::default();
-    for arg in args {
+
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-h" | "--horizontal" => layout = Layout::Horizontal,
             "-v" | "--vertical" => layout = Layout::Vertical,
-            other => bail!("unknown option: {other}"),
+            other => anyhow::bail!("unknown option: {other}"),
         }
     }
-    Ok(layout)
+
+    Ok(CliOptions { layout })
 }
 
-fn fit_horizontal_label(title: &str, cell_width: u16) -> (String, u16) {
-    let sanitized = sanitize_ascii(title);
-    if sanitized.is_empty() {
-        return (sanitized, 0);
+#[derive(Clone)]
+struct Style {
+    overlay_background: u32,
+    highlight_background: u32,
+    text_color: u32,
+    text_selected_color: u32,
+    overlay_width: u16,
+    row_height: u16,
+    padding: u16,
+    screen_margin: u16,
+    icon_max_size: u16,
+    icon_margin: u16,
+    vertical_text_gap: i16,
+    vertical_text_baseline: i16,
+    horizontal_item_width: u16,
+    horizontal_item_height: u16,
+    horizontal_text_offset: i16,
+    horizontal_text_baseline: i16,
+    horizontal_char_width_estimate: u16,
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Self {
+            overlay_background: 0x000000,
+            highlight_background: 0xFFFFFF,
+            text_color: 0xFFFFFF,
+            text_selected_color: 0x000000,
+            overlay_width: DEFAULT_OVERLAY_WIDTH,
+            row_height: DEFAULT_ROW_HEIGHT,
+            padding: DEFAULT_PADDING,
+            screen_margin: DEFAULT_SCREEN_MARGIN,
+            icon_max_size: DEFAULT_ICON_MAX_SIZE,
+            icon_margin: DEFAULT_ICON_MARGIN,
+            vertical_text_gap: DEFAULT_VERTICAL_TEXT_GAP,
+            vertical_text_baseline: DEFAULT_VERTICAL_TEXT_BASELINE,
+            horizontal_item_width: DEFAULT_HORIZONTAL_ITEM_WIDTH,
+            horizontal_item_height: DEFAULT_HORIZONTAL_ITEM_HEIGHT,
+            horizontal_text_offset: DEFAULT_HORIZONTAL_TEXT_OFFSET,
+            horizontal_text_baseline: DEFAULT_HORIZONTAL_TEXT_BASELINE,
+            horizontal_char_width_estimate: DEFAULT_HORIZONTAL_CHAR_WIDTH,
+        }
+    }
+}
+
+impl Style {
+    fn icon_area(&self) -> u16 {
+        self.icon_max_size + self.icon_margin * 2
     }
 
-    let margin = (H_TEXT_OFFSET as u16) * 2;
-    if cell_width <= margin {
-        return (String::new(), 0);
+    fn vertical_text_offset(&self) -> i16 {
+        self.icon_area() as i16 + self.vertical_text_gap
     }
 
-    let available = cell_width.saturating_sub(margin);
-    let mut max_chars = usize::from(available) / usize::from(H_CHAR_WIDTH_ESTIMATE);
-    if max_chars == 0 {
-        max_chars = 1;
+    fn fit_horizontal_label(&self, title: &str, cell_width: u16) -> (String, u16) {
+        let sanitized = sanitize_ascii(title);
+        if sanitized.is_empty() {
+            return (sanitized, 0);
+        }
+
+        let margin = (self.horizontal_text_offset as u16) * 2;
+        if cell_width <= margin {
+            return (String::new(), 0);
+        }
+
+        let available = cell_width.saturating_sub(margin);
+        let mut max_chars =
+            usize::from(available) / usize::from(self.horizontal_char_width_estimate.max(1));
+        if max_chars == 0 {
+            max_chars = 1;
+        }
+
+        let mut label = sanitized;
+        if label.len() > max_chars {
+            if max_chars <= 3 {
+                label = ".".repeat(max_chars);
+            } else {
+                let keep = max_chars - 3;
+                label.truncate(keep);
+                label.push_str("...");
+            }
+        }
+
+        let approx_width = (label.len() as u16)
+            .saturating_mul(self.horizontal_char_width_estimate.max(1))
+            .min(available);
+        (label, approx_width)
     }
 
-    let mut label = sanitized;
-    if label.len() > max_chars {
-        if max_chars <= 3 {
-            label = ".".repeat(max_chars);
-        } else {
-            let keep = max_chars - 3;
-            label.truncate(keep);
-            label.push_str("...");
+    fn load_from_config() -> Result<Self> {
+        let mut style = Self::default();
+        if let Some(path) = default_style_path() {
+            if path.exists() {
+                let css = fs::read_to_string(&path)
+                    .with_context(|| format!("failed to read css file {}", path.display()))?;
+                let rules = parse_css_rules(&css)?;
+                style.apply_rules(&rules)?;
+            }
+        }
+        Ok(style)
+    }
+
+    fn apply_rules(&mut self, rules: &CssRules) -> Result<()> {
+        if let Some(root) = rules.get(":root") {
+            self.apply_root(root)?;
+        }
+
+        if let Some(overlay) = rules.get("overlay") {
+            if let Some(value) = overlay.get("background") {
+                self.overlay_background = parse_color(value)?;
+            }
+            if let Some(value) = overlay.get("width") {
+                self.overlay_width = parse_u16_px(value)?;
+            }
+            if let Some(value) = overlay.get("padding") {
+                self.padding = parse_u16_px(value)?;
+            }
+            if let Some(value) = overlay.get("screen-margin") {
+                self.screen_margin = parse_u16_px(value)?;
+            }
+        }
+
+        if let Some(item) = rules.get("item") {
+            if let Some(value) = item.get("height") {
+                self.row_height = parse_u16_px(value)?;
+            }
+            if let Some(value) = item.get("icon-size") {
+                self.icon_max_size = parse_u16_px(value)?;
+            }
+            if let Some(value) = item.get("icon-margin") {
+                self.icon_margin = parse_u16_px(value)?;
+            }
+        }
+
+        if let Some(selected) = rules.get("item:selected") {
+            if let Some(value) = selected.get("background") {
+                self.highlight_background = parse_color(value)?;
+            }
+            if let Some(value) = selected.get("color") {
+                self.text_selected_color = parse_color(value)?;
+            }
+        }
+
+        if let Some(label) = rules.get("label") {
+            if let Some(value) = label.get("color") {
+                self.text_color = parse_color(value)?;
+            }
+        }
+
+        if let Some(label_sel) = rules.get("label:selected") {
+            if let Some(value) = label_sel.get("color") {
+                self.text_selected_color = parse_color(value)?;
+            }
+        }
+
+        if let Some(horizontal) = rules.get("horizontal") {
+            if let Some(value) = horizontal.get("item-width") {
+                self.horizontal_item_width = parse_u16_px(value)?;
+            }
+            if let Some(value) = horizontal.get("item-height") {
+                self.horizontal_item_height = parse_u16_px(value)?;
+            }
+            if let Some(value) = horizontal.get("text-offset") {
+                self.horizontal_text_offset = parse_i16_px(value)?;
+            }
+            if let Some(value) = horizontal.get("text-baseline") {
+                self.horizontal_text_baseline = parse_i16_px(value)?;
+            }
+            if let Some(value) = horizontal.get("char-width") {
+                self.horizontal_char_width_estimate = parse_u16_px(value)?;
+            }
+        }
+
+        if let Some(vertical) = rules.get("vertical") {
+            if let Some(value) = vertical.get("text-gap") {
+                self.vertical_text_gap = parse_i16_px(value)?;
+            }
+            if let Some(value) = vertical.get("text-baseline") {
+                self.vertical_text_baseline = parse_i16_px(value)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn apply_root(&mut self, declarations: &CssDeclarations) -> Result<()> {
+        for (name, value) in declarations {
+            match name.as_str() {
+                "--overlay-background" => self.overlay_background = parse_color(value)?,
+                "--highlight-background" => self.highlight_background = parse_color(value)?,
+                "--text-color" => self.text_color = parse_color(value)?,
+                "--text-selected-color" => {
+                    self.text_selected_color = parse_color(value)?;
+                }
+                "--overlay-width" => self.overlay_width = parse_u16_px(value)?,
+                "--padding" => self.padding = parse_u16_px(value)?,
+                "--screen-margin" => self.screen_margin = parse_u16_px(value)?,
+                "--row-height" => self.row_height = parse_u16_px(value)?,
+                "--icon-size" => self.icon_max_size = parse_u16_px(value)?,
+                "--icon-margin" => self.icon_margin = parse_u16_px(value)?,
+                "--vertical-text-gap" => self.vertical_text_gap = parse_i16_px(value)?,
+                "--vertical-text-baseline" => {
+                    self.vertical_text_baseline = parse_i16_px(value)?;
+                }
+                "--horizontal-item-width" => {
+                    self.horizontal_item_width = parse_u16_px(value)?;
+                }
+                "--horizontal-item-height" => {
+                    self.horizontal_item_height = parse_u16_px(value)?;
+                }
+                "--horizontal-text-offset" => {
+                    self.horizontal_text_offset = parse_i16_px(value)?;
+                }
+                "--horizontal-text-baseline" => {
+                    self.horizontal_text_baseline = parse_i16_px(value)?;
+                }
+                "--horizontal-char-width" => {
+                    self.horizontal_char_width_estimate = parse_u16_px(value)?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+fn default_style_path() -> Option<PathBuf> {
+    if let Some(config_home) = env::var_os("XDG_CONFIG_HOME") {
+        let mut path = PathBuf::from(config_home);
+        path.push("xwitcher");
+        path.push("style.css");
+        return Some(path);
+    }
+
+    if let Some(home) = env::var_os("HOME") {
+        let mut path = PathBuf::from(home);
+        path.push(".config");
+        path.push("xwitcher");
+        path.push("style.css");
+        return Some(path);
+    }
+
+    None
+}
+
+type CssDeclarations = HashMap<String, String>;
+type CssRules = HashMap<String, CssDeclarations>;
+
+fn parse_css_rules(source: &str) -> Result<CssRules> {
+    let mut rules = HashMap::new();
+    let cleaned = strip_css_comments(source);
+    let chars: Vec<char> = cleaned.chars().collect();
+    let mut idx = 0usize;
+
+    while idx < chars.len() {
+        while idx < chars.len() && chars[idx].is_whitespace() {
+            idx += 1;
+        }
+        if idx >= chars.len() {
+            break;
+        }
+
+        let selector_start = idx;
+        while idx < chars.len() && chars[idx] != '{' {
+            idx += 1;
+        }
+        if idx >= chars.len() {
+            break;
+        }
+        let selector_raw: String = chars[selector_start..idx].iter().collect();
+        let selectors: Vec<String> = selector_raw
+            .split(',')
+            .map(|s| s.trim().to_lowercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        idx += 1; // skip '{'
+
+        let block_start = idx;
+        let mut depth = 1;
+        while idx < chars.len() && depth > 0 {
+            match chars[idx] {
+                '{' => depth += 1,
+                '}' => depth -= 1,
+                _ => {}
+            }
+            idx += 1;
+        }
+        if depth != 0 {
+            anyhow::bail!("unmatched braces in css");
+        }
+        let block_end = idx.saturating_sub(1);
+        let block: String = chars[block_start..block_end].iter().collect();
+        let declarations = parse_declarations(&block);
+
+        for selector in selectors {
+            if selector.is_empty() {
+                continue;
+            }
+            let entry = rules.entry(selector).or_insert_with(HashMap::new);
+            for (prop, value) in &declarations {
+                entry.insert(prop.clone(), value.clone());
+            }
         }
     }
 
-    let approx_width = (label.len() as u16)
-        .saturating_mul(H_CHAR_WIDTH_ESTIMATE)
-        .min(available);
-    (label, approx_width)
+    Ok(rules)
+}
+
+fn parse_declarations(block: &str) -> CssDeclarations {
+    let mut map = HashMap::new();
+    for declaration in block.split(';') {
+        let decl = declaration.trim();
+        if decl.is_empty() {
+            continue;
+        }
+        if let Some(pos) = decl.find(':') {
+            let name = decl[..pos].trim().to_lowercase();
+            let value = decl[pos + 1..]
+                .trim()
+                .trim_matches('"')
+                .trim_matches('\'')
+                .to_string();
+            if !name.is_empty() && !value.is_empty() {
+                map.insert(name, value);
+            }
+        }
+    }
+    map
+}
+
+fn strip_css_comments(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut idx = 0;
+    while idx < bytes.len() {
+        if bytes[idx] == b'/' && idx + 1 < bytes.len() && bytes[idx + 1] == b'*' {
+            idx += 2;
+            while idx + 1 < bytes.len() {
+                if bytes[idx] == b'*' && bytes[idx + 1] == b'/' {
+                    idx += 2;
+                    break;
+                }
+                idx += 1;
+            }
+        } else {
+            result.push(bytes[idx] as char);
+            idx += 1;
+        }
+    }
+    result
+}
+
+fn parse_color(value: &str) -> Result<u32> {
+    let trimmed = value.trim();
+    if let Some(hex) = trimmed.strip_prefix('#') {
+        let hex = hex.trim();
+        let digits = hex.len();
+        let parsed =
+            u32::from_str_radix(hex, 16).with_context(|| format!("invalid hex color: {value}"))?;
+        return Ok(match digits {
+            3 => {
+                let r = ((parsed >> 8) & 0xF) as u32;
+                let g = ((parsed >> 4) & 0xF) as u32;
+                let b = (parsed & 0xF) as u32;
+                (r * 17 << 16) | (g * 17 << 8) | (b * 17)
+            }
+            4 => {
+                let r = ((parsed >> 12) & 0xF) as u32;
+                let g = ((parsed >> 8) & 0xF) as u32;
+                let b = ((parsed >> 4) & 0xF) as u32;
+                ((r * 17) << 16) | ((g * 17) << 8) | (b * 17)
+            }
+            6 => parsed,
+            8 => parsed >> 8, // drop alpha
+            _ => anyhow::bail!("unsupported hex color length: #{hex}"),
+        });
+    }
+
+    if let Some(body) = trimmed
+        .strip_prefix("rgb(")
+        .and_then(|v| v.strip_suffix(')'))
+    {
+        let parts: Vec<&str> = body.split(',').map(|p| p.trim()).collect();
+        if parts.len() != 3 {
+            anyhow::bail!("rgb() expects three components: {value}");
+        }
+        let mut rgb = [0u32; 3];
+        for (idx, part) in parts.iter().enumerate() {
+            let component: f64 = part
+                .parse()
+                .with_context(|| format!("invalid rgb component: {part}"))?;
+            if !(0.0..=255.0).contains(&component) {
+                anyhow::bail!("rgb component out of range: {part}");
+            }
+            rgb[idx] = component.round() as u32;
+        }
+        return Ok((rgb[0] << 16) | (rgb[1] << 8) | rgb[2]);
+    }
+
+    match trimmed.to_ascii_lowercase().as_str() {
+        "black" => Ok(0x000000),
+        "white" => Ok(0xFFFFFF),
+        "red" => Ok(0xFF0000),
+        "green" => Ok(0x008000),
+        "blue" => Ok(0x0000FF),
+        other => anyhow::bail!("unsupported color value: {other}"),
+    }
+}
+
+fn parse_u16_px(value: &str) -> Result<u16> {
+    let trimmed = value.trim();
+    let numeric_str = if trimmed.to_ascii_lowercase().ends_with("px") {
+        &trimmed[..trimmed.len() - 2]
+    } else {
+        trimmed
+    }
+    .trim();
+    let parsed: f64 = numeric_str
+        .parse()
+        .with_context(|| format!("invalid length value: {value}"))?;
+    if parsed < 0.0 {
+        anyhow::bail!("length cannot be negative: {value}");
+    }
+    if parsed > u16::MAX as f64 {
+        anyhow::bail!("length too large: {value}");
+    }
+    Ok(parsed.round() as u16)
+}
+
+fn parse_i16_px(value: &str) -> Result<i16> {
+    let trimmed = value.trim();
+    let numeric_str = if trimmed.to_ascii_lowercase().ends_with("px") {
+        &trimmed[..trimmed.len() - 2]
+    } else {
+        trimmed
+    }
+    .trim();
+    let parsed: f64 = numeric_str
+        .parse()
+        .with_context(|| format!("invalid length value: {value}"))?;
+    if parsed < i16::MIN as f64 || parsed > i16::MAX as f64 {
+        anyhow::bail!("length out of range: {value}");
+    }
+    Ok(parsed.round() as i16)
 }
 
 #[allow(non_snake_case)]
@@ -137,10 +556,11 @@ impl Atoms {
 }
 
 fn main() -> Result<()> {
-    let layout = parse_layout(env::args().skip(1))?;
+    let options = parse_cli_options(env::args().skip(1))?;
+    let style = Style::load_from_config()?;
     let (conn, screen_num) = x11rb::connect(None).context("failed to connect to X server")?;
     let atoms = Atoms::new(&conn).context("failed to intern atoms")?;
-    let mut app = AltTab::new(conn, screen_num, atoms, layout)?;
+    let mut app = AltTab::new(conn, screen_num, atoms, options.layout, style)?;
     app.run()
 }
 
@@ -149,6 +569,7 @@ struct AltTab {
     screen_num: usize,
     atoms: Atoms,
     layout: Layout,
+    style: Style,
     bindings: KeyBindings,
     state: Option<OverlayState>,
     icon_theme: IconTheme,
@@ -156,16 +577,24 @@ struct AltTab {
 }
 
 impl AltTab {
-    fn new(conn: RustConnection, screen_num: usize, atoms: Atoms, layout: Layout) -> Result<Self> {
+    fn new(
+        conn: RustConnection,
+        screen_num: usize,
+        atoms: Atoms,
+        layout: Layout,
+        style: Style,
+    ) -> Result<Self> {
         let bindings = KeyBindings::load(&conn)?;
+        let icon_theme = IconTheme::new(style.icon_max_size);
         let mut app = Self {
             conn,
             screen_num,
             atoms,
             layout,
+            style,
             bindings,
             state: None,
-            icon_theme: IconTheme::new(),
+            icon_theme,
             mru: Vec::new(),
         };
         app.register_root_events()?;
@@ -335,7 +764,7 @@ impl AltTab {
             }
         }
 
-        let overlay = self.create_overlay(self.layout, entries.len())?;
+        let overlay = self.create_overlay(entries.len())?;
         let mut state = OverlayState::new(entries, overlay);
         if state.windows.len() > 1 {
             state.advance(direction);
@@ -379,25 +808,33 @@ impl AltTab {
             Some(state) => state,
             None => return Ok(()),
         };
-        self.conn.clear_area(
-            false,
+
+        let background_rect = Rectangle {
+            x: 0,
+            y: 0,
+            width: state.overlay.width,
+            height: state.overlay.height,
+        };
+        self.conn.poly_fill_rectangle(
             state.overlay.window,
-            0,
-            0,
-            state.overlay.width,
-            state.overlay.height,
+            state.overlay.background_gc,
+            &[background_rect],
         )?;
 
         match state.overlay.layout {
             Layout::Vertical => {
+                let padding = self.style.padding as i16;
+                let row_height = self.style.row_height;
+                let text_offset = self.style.vertical_text_offset();
+                let text_baseline = self.style.vertical_text_baseline;
                 for (idx, window_index) in state.visible_range().enumerate() {
                     let entry = &state.windows[window_index];
-                    let rect_y = PADDING as i16 + (idx as i16) * ROW_HEIGHT as i16;
+                    let rect_y = padding + (idx as i16) * row_height as i16;
                     let rect = Rectangle {
-                        x: PADDING as i16,
+                        x: padding,
                         y: rect_y,
-                        width: state.overlay.width.saturating_sub(2 * PADDING),
-                        height: ROW_HEIGHT,
+                        width: state.overlay.width.saturating_sub(self.style.padding * 2),
+                        height: row_height,
                     };
 
                     let is_selected = window_index == state.current;
@@ -410,8 +847,8 @@ impl AltTab {
                     }
 
                     if let Some(icon) = &entry.icon {
-                        let icon_x = rect.x + ICON_MARGIN as i16;
-                        let icon_y = rect.y + max(0, (ROW_HEIGHT as i16 - icon.height as i16) / 2);
+                        let icon_x = rect.x + self.style.icon_margin as i16;
+                        let icon_y = rect.y + max(0, (row_height as i16 - icon.height as i16) / 2);
                         self.draw_icon(&state.overlay, icon, icon_x, icon_y, is_selected)?;
                     }
 
@@ -424,32 +861,34 @@ impl AltTab {
                     self.draw_text(
                         state.overlay.window,
                         gc,
-                        rect.x + TEXT_OFFSET,
-                        rect.y + TEXT_BASELINE,
+                        rect.x + text_offset,
+                        rect.y + text_baseline,
                         &entry.title,
                     )?;
                 }
             }
             Layout::Horizontal => {
                 let capacity = max(1, state.overlay.visible_capacity);
-                let available_width = state.overlay.width.saturating_sub(PADDING * 2);
-                let mut cell_width_u32 = u32::from(H_ITEM_WIDTH);
+                let padding = self.style.padding;
+                let available_width = state.overlay.width.saturating_sub(padding * 2);
+                let mut cell_width_u32 = u32::from(self.style.horizontal_item_width);
                 let available_width_u32 = u32::from(available_width);
                 if cell_width_u32 * capacity as u32 > available_width_u32 {
                     cell_width_u32 = max(1, available_width_u32 / capacity as u32);
                 }
                 let cell_width = cell_width_u32 as u16;
-                let cell_height = max(ICON_AREA, state.overlay.height.saturating_sub(PADDING * 2));
+                let icon_area = self.style.icon_area();
+                let cell_height = max(icon_area, state.overlay.height.saturating_sub(padding * 2));
                 let total_items_width = cell_width_u32 * capacity as u32;
                 let extra_space = available_width_u32.saturating_sub(total_items_width);
-                let leading_offset = PADDING as i16 + (extra_space / 2) as i16;
+                let leading_offset = padding as i16 + (extra_space / 2) as i16;
 
                 for (idx, window_index) in state.visible_range().enumerate() {
                     let entry = &state.windows[window_index];
                     let cell_x = leading_offset + (idx as u32 * cell_width_u32) as i16;
                     let rect = Rectangle {
                         x: cell_x,
-                        y: PADDING as i16,
+                        y: padding as i16,
                         width: cell_width,
                         height: cell_height,
                     };
@@ -466,8 +905,8 @@ impl AltTab {
                     if let Some(icon) = &entry.icon {
                         let icon_x =
                             cell_x + max(0, (cell_width as i32 - icon.width as i32) / 2) as i16;
-                        let icon_y = PADDING as i16
-                            + max(0, (ICON_AREA as i32 - icon.height as i32) / 2) as i16;
+                        let icon_y = padding as i16
+                            + max(0, (icon_area as i32 - icon.height as i32) / 2) as i16;
                         self.draw_icon(&state.overlay, icon, icon_x, icon_y, is_selected)?;
                     }
 
@@ -477,16 +916,17 @@ impl AltTab {
                         state.overlay.text_gc
                     };
 
-                    let (label, approx_width) = fit_horizontal_label(&entry.title, cell_width);
+                    let (label, approx_width) =
+                        self.style.fit_horizontal_label(&entry.title, cell_width);
                     if !label.is_empty() && approx_width > 0 {
                         let centered_offset =
                             ((cell_width as i32 - i32::from(approx_width)) / 2).max(0) as i16;
                         let mut text_x = cell_x + centered_offset;
-                        let min_x = cell_x + H_TEXT_OFFSET;
+                        let min_x = cell_x + self.style.horizontal_text_offset;
                         if text_x < min_x {
                             text_x = min_x;
                         }
-                        let max_x = cell_x + cell_width as i16 - H_TEXT_OFFSET;
+                        let max_x = cell_x + cell_width as i16 - self.style.horizontal_text_offset;
                         if text_x > max_x {
                             text_x = max_x;
                         }
@@ -495,7 +935,7 @@ impl AltTab {
                             state.overlay.window,
                             gc,
                             text_x,
-                            PADDING as i16 + H_TEXT_BASELINE,
+                            padding as i16 + self.style.horizontal_text_baseline,
                             &label,
                         )?;
                     }
@@ -549,7 +989,11 @@ impl AltTab {
         let row_stride = ((width as usize * bytes_per_pixel + pad - 1) / pad) * pad;
         let mut data = vec![0u8; row_stride * height as usize];
 
-        let bg = if selected { 0xFFFFFF } else { 0x000000 };
+        let bg = if selected {
+            self.style.highlight_background
+        } else {
+            self.style.overlay_background
+        };
         let bg_r = ((bg >> 16) & 0xff) as u32;
         let bg_g = ((bg >> 8) & 0xff) as u32;
         let bg_b = (bg & 0xff) as u32;
@@ -613,54 +1057,72 @@ impl AltTab {
         let _ = self.conn.free_gc(overlay.text_gc);
         let _ = self.conn.free_gc(overlay.selected_text_gc);
         let _ = self.conn.free_gc(overlay.highlight_gc);
+        let _ = self.conn.free_gc(overlay.background_gc);
         let _ = self.conn.free_gc(overlay.icon_gc);
         let _ = self.conn.unmap_window(overlay.window);
         let _ = self.conn.destroy_window(overlay.window);
         Ok(())
     }
 
-    fn create_overlay(&self, layout: Layout, item_count: usize) -> Result<OverlayWindow> {
+    fn create_overlay(&self, item_count: usize) -> Result<OverlayWindow> {
         let screen = self.screen();
-        let (width, height, visible_capacity) = match layout {
+        let padding = self.style.padding;
+        let icon_area = self.style.icon_area();
+        let screen_margin = self.style.screen_margin;
+        let layout = self.layout;
+
+        let (width_u16, height_u16, visible_capacity) = match layout {
             Layout::Vertical => {
-                let width = min(OVERLAY_WIDTH, screen.width_in_pixels);
-                let mut full_height = PADDING * 2 + (item_count as u16) * ROW_HEIGHT;
-                let max_height = screen.height_in_pixels.saturating_sub(SCREEN_MARGIN);
+                let width = min(self.style.overlay_width, screen.width_in_pixels);
+
+                let mut full_height = u32::from(padding) * 2
+                    + u32::from(self.style.row_height) * item_count.max(1) as u32;
+                let max_height = screen.height_in_pixels.saturating_sub(screen_margin);
                 if max_height > 0 {
-                    full_height = min(full_height, max_height);
+                    full_height = min(full_height, u32::from(max_height));
                 }
-                let height = max(full_height, PADDING * 2 + ROW_HEIGHT);
+                let min_height = u32::from(padding) * 2 + u32::from(self.style.row_height.max(1));
+                if full_height < min_height {
+                    full_height = min_height;
+                }
+
                 let visible_rows = max(
                     1,
-                    ((height.saturating_sub(PADDING * 2)) / ROW_HEIGHT) as usize,
+                    ((full_height.saturating_sub(u32::from(padding) * 2))
+                        / u32::from(self.style.row_height.max(1))) as usize,
                 );
-                (width, height, visible_rows)
+                (width, full_height as u16, visible_rows)
             }
             Layout::Horizontal => {
                 let screen_width = screen.width_in_pixels;
-                let width_limit = if screen_width > SCREEN_MARGIN {
-                    screen_width - SCREEN_MARGIN
+                let width_limit = if screen_width > screen_margin {
+                    screen_width - screen_margin
                 } else {
                     screen_width
                 };
-                let available_for_cols = width_limit.saturating_sub(PADDING * 2);
-                let max_cols = max(1, (available_for_cols / H_ITEM_WIDTH) as usize);
+                let available_for_cols = width_limit.saturating_sub(padding * 2);
+                let item_width = self.style.horizontal_item_width.max(1);
+                let max_cols = max(
+                    1,
+                    (u32::from(available_for_cols) / u32::from(item_width)) as usize,
+                );
                 let effective_count = max(1, item_count);
                 let visible_cols = min(max_cols, effective_count);
 
                 let mut width =
-                    (u32::from(PADDING) * 2) + u32::from(H_ITEM_WIDTH) * visible_cols as u32;
+                    (u32::from(padding) * 2) + u32::from(item_width) * visible_cols as u32;
                 let screen_width_u32 = u32::from(screen_width);
                 if width > screen_width_u32 {
                     width = screen_width_u32;
                 }
 
-                let mut height = (u32::from(PADDING) * 2) + u32::from(H_ITEM_HEIGHT);
-                let max_height = screen.height_in_pixels.saturating_sub(SCREEN_MARGIN);
+                let desired_item_height = self.style.horizontal_item_height.max(icon_area);
+                let mut height = (u32::from(padding) * 2) + u32::from(desired_item_height);
+                let max_height = screen.height_in_pixels.saturating_sub(screen_margin);
                 if max_height > 0 {
                     height = min(height, u32::from(max_height));
                 }
-                let min_height = (u32::from(PADDING) * 2) + u32::from(ICON_AREA);
+                let min_height = (u32::from(padding) * 2) + u32::from(icon_area);
                 if height < min_height {
                     height = min_height;
                 }
@@ -669,8 +1131,8 @@ impl AltTab {
             }
         };
 
-        let x = ((screen.width_in_pixels.saturating_sub(width)) / 2) as i16;
-        let y = ((screen.height_in_pixels.saturating_sub(height)) / 2) as i16;
+        let x = ((screen.width_in_pixels.saturating_sub(width_u16)) / 2) as i16;
+        let y = ((screen.height_in_pixels.saturating_sub(height_u16)) / 2) as i16;
 
         let window = self
             .conn
@@ -683,8 +1145,8 @@ impl AltTab {
                 screen.root,
                 x,
                 y,
-                width,
-                height,
+                width_u16,
+                height_u16,
                 0,
                 WindowClass::INPUT_OUTPUT,
                 0,
@@ -718,19 +1180,38 @@ impl AltTab {
 
         self.conn.map_window(window)?;
 
-        let text_gc = self.create_gc(window, screen.white_pixel, screen.black_pixel)?;
-        let selected_text_gc = self.create_gc(window, screen.black_pixel, screen.white_pixel)?;
-        let highlight_gc = self.create_gc(window, screen.white_pixel, screen.white_pixel)?;
-        let icon_gc = self.create_gc(window, screen.white_pixel, screen.black_pixel)?;
+        let background_gc = self.create_gc(
+            window,
+            self.style.overlay_background,
+            self.style.overlay_background,
+        )?;
+        let text_gc =
+            self.create_gc(window, self.style.text_color, self.style.overlay_background)?;
+        let selected_text_gc = self.create_gc(
+            window,
+            self.style.text_selected_color,
+            self.style.highlight_background,
+        )?;
+        let highlight_gc = self.create_gc(
+            window,
+            self.style.highlight_background,
+            self.style.highlight_background,
+        )?;
+        let icon_gc = self.create_gc(
+            window,
+            self.style.overlay_background,
+            self.style.overlay_background,
+        )?;
 
         Ok(OverlayWindow {
             window,
             text_gc,
             selected_text_gc,
             highlight_gc,
+            background_gc,
             icon_gc,
-            width,
-            height,
+            width: width_u16,
+            height: height_u16,
             layout,
             visible_capacity,
         })
@@ -909,7 +1390,7 @@ impl AltTab {
             return Ok(None);
         }
 
-        Ok(parse_wm_icon(&values))
+        Ok(parse_wm_icon(&values, self.style.icon_max_size))
     }
 
     fn get_utf8_property(&self, window: Window, atom: u32) -> Result<Option<String>> {
@@ -1052,14 +1533,16 @@ struct IconTheme {
     cache: HashMap<String, Option<Icon>>,
     search_roots: Vec<PathBuf>,
     desktop_index: Option<HashMap<String, Vec<IconSource>>>,
+    max_icon_size: u16,
 }
 
 impl IconTheme {
-    fn new() -> Self {
+    fn new(max_icon_size: u16) -> Self {
         Self {
             cache: HashMap::new(),
             search_roots: icon_search_roots(),
             desktop_index: None,
+            max_icon_size,
         }
     }
 
@@ -1152,7 +1635,12 @@ impl IconTheme {
         if !icon_has_visible_pixels(&pixels) {
             return Ok(None);
         }
-        Ok(Some(scale_icon_to_limit(pixels, width, height)))
+        Ok(Some(scale_icon_to_limit(
+            pixels,
+            width,
+            height,
+            self.max_icon_size,
+        )))
     }
 
     fn desktop_icon_sources(&mut self, key: &str) -> Result<Option<Vec<IconSource>>> {
@@ -1182,6 +1670,7 @@ struct OverlayWindow {
     text_gc: Gcontext,
     selected_text_gc: Gcontext,
     highlight_gc: Gcontext,
+    background_gc: Gcontext,
     icon_gc: Gcontext,
     width: u16,
     height: u16,
@@ -1344,8 +1833,8 @@ fn intern_atom(conn: &RustConnection, name: &str) -> Result<Atom> {
     Ok(reply.atom)
 }
 
-fn parse_wm_icon(data: &[u32]) -> Option<Icon> {
-    let target = ICON_MAX_SIZE as usize;
+fn parse_wm_icon(data: &[u32], max_icon_size: u16) -> Option<Icon> {
+    let target = max_icon_size as usize;
     let mut best: Option<(usize, usize, Vec<u32>)> = None;
     let mut fallback: Option<(usize, usize, Vec<u32>)> = None;
 
@@ -1392,7 +1881,7 @@ fn parse_wm_icon(data: &[u32]) -> Option<Icon> {
         fallback?
     };
 
-    Some(scale_icon_to_limit(pixels, width, height))
+    Some(scale_icon_to_limit(pixels, width, height, max_icon_size))
 }
 
 fn build_desktop_index() -> Result<HashMap<String, Vec<IconSource>>> {
@@ -1677,7 +2166,7 @@ fn icon_file_matches(path: &Path, names: &[String]) -> bool {
     })
 }
 
-fn scale_icon_to_limit(pixels: Vec<u32>, width: usize, height: usize) -> Icon {
+fn scale_icon_to_limit(pixels: Vec<u32>, width: usize, height: usize, max_icon_size: u16) -> Icon {
     if width == 0 || height == 0 {
         return Icon {
             width: 0,
@@ -1686,7 +2175,7 @@ fn scale_icon_to_limit(pixels: Vec<u32>, width: usize, height: usize) -> Icon {
         };
     }
 
-    let target = ICON_MAX_SIZE as usize;
+    let target = usize::from(max_icon_size);
     if width <= target && height <= target {
         return Icon {
             width: width as u16,

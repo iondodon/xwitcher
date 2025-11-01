@@ -1,0 +1,55 @@
+:root {
+  --overlay-background: #16181c;
+  --highlight-background: #4b90ff;
+  --text-color: #d9dde8;
+  --text-selected-color: #16181c;
+  --overlay-width: 640px;
+  --padding: 18px;
+  --screen-margin: 96px;
+  --row-height: 60px;
+  --icon-size: 44px;
+  --icon-margin: 10px;
+  --vertical-text-gap: 10px;
+  --vertical-text-baseline: 38px;
+  --horizontal-item-width: 140px;
+  --horizontal-item-height: 110px;
+  --horizontal-text-offset: 10px;
+  --horizontal-text-baseline: 90px;
+  --horizontal-char-width: 7px;
+}
+
+overlay {
+  background: #16181c;
+  padding: 18px;
+}
+
+item {
+  height: 60px;
+  icon-size: 44px;
+  icon-margin: 10px;
+}
+
+item:selected {
+  background: #4b90ff;
+  color: #16181c;
+}
+
+label {
+  color: #d9dde8;
+}
+
+label:selected {
+  color: #16181c;
+}
+
+horizontal {
+  item-width: 140px;
+  item-height: 110px;
+  text-offset: 10px;
+  text-baseline: 90px;
+}
+
+vertical {
+  text-gap: 10px;
+  text-baseline: 38px;
+}

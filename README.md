@@ -51,6 +51,36 @@ xwitcher --vertical    # stack entries vertically
 
 Short aliases `-h` and `-v` are also supported.
 
+### Styling with CSS
+
+Create a stylesheet at `~/.config/xwitcher/style.css` (or `$XDG_CONFIG_HOME/xwitcher/style.css`) to tweak colours, spacing, and sizing without recompiling. A ready-to-copy template lives in `styles/style.css`. The parser understands a small subset of CSS:
+
+- `:root` custom properties (`--overlay-background`, `--highlight-background`, `--text-color`, `--text-selected-color`, `--overlay-width`, `--padding`, `--screen-margin`, `--row-height`, `--icon-size`, `--icon-margin`, `--vertical-text-gap`, `--vertical-text-baseline`, `--horizontal-item-width`, `--horizontal-item-height`, `--horizontal-text-offset`, `--horizontal-text-baseline`, `--horizontal-char-width`).
+- Element selectors such as `overlay`, `item`, `item:selected`, `label`, `label:selected`, `horizontal`, and `vertical` with the following properties:
+  - `overlay { background, width, padding, screen-margin }`
+  - `item { height, icon-size, icon-margin }`
+  - `item:selected { background, color }`
+  - `label { color }` and `label:selected { color }`
+  - `horizontal { item-width, item-height, text-offset, text-baseline, char-width }`
+  - `vertical { text-gap, text-baseline }`
+
+All lengths should be expressed in pixels (e.g. `56px`), and colours accept hex (`#112233`), `rgb()`, or simple names like `white`. For example:
+
+```css
+:root {
+  --overlay-background: #1a1c1f;
+  --highlight-background: #4b90ff;
+  --text-color: #dde1f2;
+  --text-selected-color: #0c101c;
+  --icon-size: 48px;
+}
+
+overlay { padding: 20px; }
+item:selected { background: #4b90ff; color: #0c101c; }
+label { color: #dde1f2; }
+horizontal { item-width: 160px; text-offset: 12px; }
+```
+
 ## Keyboard behaviour
 
 - `Alt+Tab`: cycle forward through the window list.
