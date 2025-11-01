@@ -55,11 +55,11 @@ Short aliases `-h` and `-v` are also supported.
 
 Create a stylesheet at `~/.config/xwitcher/style.css` (or `$XDG_CONFIG_HOME/xwitcher/style.css`) to tweak colours, spacing, and sizing without recompiling. A ready-to-copy template lives in `styles/style.css`. The parser understands a small subset of CSS:
 
-- `:root` custom properties (`--overlay-background`, `--highlight-background`, `--text-color`, `--text-selected-color`, `--overlay-width`, `--padding`, `--screen-margin`, `--row-height`, `--icon-size`, `--icon-margin`, `--vertical-text-gap`, `--vertical-text-baseline`, `--horizontal-item-width`, `--horizontal-item-height`, `--horizontal-text-offset`, `--horizontal-text-baseline`, `--horizontal-char-width`).
+- `:root` custom properties (`--overlay-background`, `--highlight-background`, `--text-color`, `--text-selected-color`, `--overlay-width`, `--padding`, `--screen-margin`, `--row-height`, `--icon-size`, `--icon-margin`, `--vertical-text-gap`, `--vertical-text-baseline`, `--horizontal-item-width`, `--horizontal-item-height`, `--horizontal-text-offset`, `--horizontal-text-baseline`, `--horizontal-char-width`, `--overlay-border-width`, `--overlay-border-color`, `--item-border-width`, `--item-border-color`, `--item-selected-border-color`).
 - Element selectors such as `overlay`, `item`, `item:selected`, `label`, `label:selected`, `horizontal`, and `vertical` with the following properties:
-  - `overlay { background, width, padding, screen-margin }`
-  - `item { height, icon-size, icon-margin }`
-  - `item:selected { background, color }`
+  - `overlay { background, width, padding, screen-margin, border-width, border-color }`
+  - `item { height, icon-size, icon-margin, border-width, border-color }`
+  - `item:selected { background, color, border-color }`
   - `label { color }` and `label:selected { color }`
   - `horizontal { item-width, item-height, text-offset, text-baseline, char-width }`
   - `vertical { text-gap, text-baseline }`

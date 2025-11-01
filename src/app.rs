@@ -14,8 +14,8 @@ use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::protocol::xproto::{
     AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent, CreateWindowAux,
     EventMask, Gcontext, GrabMode, ImageFormat, ImageOrder, InputFocus, KeyButMask, KeyPressEvent,
-    KeyReleaseEvent, Keycode, MapState, ModMask, PropMode, PropertyNotifyEvent, Rectangle, Screen,
-    Window, WindowClass,
+    KeyReleaseEvent, Keycode, LineStyle, MapState, ModMask, PropMode, PropertyNotifyEvent,
+    Rectangle, Screen, Window, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 use x11rb::wrapper::ConnectionExt as _;
@@ -307,6 +307,25 @@ impl AltTab {
                         self.draw_icon(&state.overlay, icon, icon_x, icon_y, is_selected)?;
                     }
 
+                    if self.style.item_border_width > 0 {
+                        let border_gc = if is_selected {
+                            state
+                                .overlay
+                                .item_selected_border_gc
+                                .or(state.overlay.item_border_gc)
+                        } else {
+                            state.overlay.item_border_gc
+                        };
+                        if let Some(gc) = border_gc {
+                            self.draw_rect_border(
+                                state.overlay.window,
+                                gc,
+                                rect,
+                                self.style.item_border_width,
+                            )?;
+                        }
+                    }
+
                     let gc = if is_selected {
                         state.overlay.selected_text_gc
                     } else {
@@ -365,6 +384,25 @@ impl AltTab {
                         self.draw_icon(&state.overlay, icon, icon_x, icon_y, is_selected)?;
                     }
 
+                    if self.style.item_border_width > 0 {
+                        let border_gc = if is_selected {
+                            state
+                                .overlay
+                                .item_selected_border_gc
+                                .or(state.overlay.item_border_gc)
+                        } else {
+                            state.overlay.item_border_gc
+                        };
+                        if let Some(gc) = border_gc {
+                            self.draw_rect_border(
+                                state.overlay.window,
+                                gc,
+                                rect,
+                                self.style.item_border_width,
+                            )?;
+                        }
+                    }
+
                     let gc = if is_selected {
                         state.overlay.selected_text_gc
                     } else {
@@ -395,6 +433,23 @@ impl AltTab {
                         )?;
                     }
                 }
+            }
+        }
+
+        if self.style.overlay_border_width > 0 {
+            if let Some(gc) = state.overlay.border_gc {
+                let rect = Rectangle {
+                    x: 0,
+                    y: 0,
+                    width: state.overlay.width,
+                    height: state.overlay.height,
+                };
+                self.draw_rect_border(
+                    state.overlay.window,
+                    gc,
+                    rect,
+                    self.style.overlay_border_width,
+                )?;
             }
         }
         self.conn.flush()?;
@@ -508,12 +563,50 @@ impl AltTab {
         Ok(())
     }
 
+    fn draw_rect_border(
+        &self,
+        window: Window,
+        gc: Gcontext,
+        rect: Rectangle,
+        stroke: u16,
+    ) -> Result<()> {
+        if stroke == 0 {
+            return Ok(());
+        }
+        let stroke_i = stroke as i16;
+        let inset = stroke_i / 2;
+        let width = rect.width as i32 - stroke as i32;
+        let height = rect.height as i32 - stroke as i32;
+        if width <= 0 || height <= 0 {
+            return Ok(());
+        }
+        let border_rect = Rectangle {
+            x: rect.x + inset,
+            y: rect.y + inset,
+            width: width as u16,
+            height: height as u16,
+        };
+        self.conn
+            .poly_rectangle(window, gc, &[border_rect])
+            .context("failed to draw border")?;
+        Ok(())
+    }
+
     fn destroy_overlay(&self, overlay: &OverlayWindow) -> Result<()> {
         let _ = self.conn.free_gc(overlay.text_gc);
         let _ = self.conn.free_gc(overlay.selected_text_gc);
         let _ = self.conn.free_gc(overlay.highlight_gc);
         let _ = self.conn.free_gc(overlay.background_gc);
         let _ = self.conn.free_gc(overlay.icon_gc);
+        if let Some(gc) = overlay.border_gc {
+            let _ = self.conn.free_gc(gc);
+        }
+        if let Some(gc) = overlay.item_border_gc {
+            let _ = self.conn.free_gc(gc);
+        }
+        if let Some(gc) = overlay.item_selected_border_gc {
+            let _ = self.conn.free_gc(gc);
+        }
         let _ = self.conn.unmap_window(overlay.window);
         let _ = self.conn.destroy_window(overlay.window);
         Ok(())
@@ -657,6 +750,24 @@ impl AltTab {
             self.style.overlay_background,
             self.style.overlay_background,
         )?;
+        let border_gc = self.maybe_create_line_gc(
+            window,
+            self.style.overlay_border_color,
+            self.style.overlay_background,
+            self.style.overlay_border_width,
+        )?;
+        let item_border_gc = self.maybe_create_line_gc(
+            window,
+            self.style.item_border_color,
+            self.style.overlay_background,
+            self.style.item_border_width,
+        )?;
+        let item_selected_border_gc = self.maybe_create_line_gc(
+            window,
+            self.style.item_selected_border_color,
+            self.style.highlight_background,
+            self.style.item_border_width,
+        )?;
 
         Ok(OverlayWindow {
             window,
@@ -665,6 +776,9 @@ impl AltTab {
             highlight_gc,
             background_gc,
             icon_gc,
+            border_gc,
+            item_border_gc,
+            item_selected_border_gc,
             width: width_u16,
             height: height_u16,
             layout,
@@ -679,6 +793,39 @@ impl AltTab {
             .background(background);
         self.conn.create_gc(gc, window, &aux)?;
         Ok(gc)
+    }
+
+    fn create_line_gc(
+        &self,
+        window: Window,
+        foreground: u32,
+        background: u32,
+        line_width: u16,
+    ) -> Result<Gcontext> {
+        let gc = self.conn.generate_id()?;
+        let aux = x11rb::protocol::xproto::CreateGCAux::new()
+            .foreground(foreground)
+            .background(background)
+            .line_width(Some(u32::from(line_width.max(1))))
+            .line_style(LineStyle::SOLID);
+        self.conn.create_gc(gc, window, &aux)?;
+        Ok(gc)
+    }
+
+    fn maybe_create_line_gc(
+        &self,
+        window: Window,
+        color: u32,
+        background: u32,
+        line_width: u16,
+    ) -> Result<Option<Gcontext>> {
+        if line_width == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(
+                self.create_line_gc(window, color, background, line_width)?,
+            ))
+        }
     }
 
     fn collect_windows(&mut self) -> Result<Vec<WindowEntry>> {

@@ -16,22 +16,32 @@
   --horizontal-text-offset: 10px;
   --horizontal-text-baseline: 90px;
   --horizontal-char-width: 7px;
+  --overlay-border-width: 2px;
+  --overlay-border-color: #4b90ff;
+  --item-border-width: 1px;
+  --item-border-color: #4b90ff;
+  --item-selected-border-color: #16181c;
 }
 
 overlay {
   background: #16181c;
   padding: 18px;
+  border-width: 2px;
+  border-color: #4b90ff;
 }
 
 item {
   height: 60px;
   icon-size: 44px;
   icon-margin: 10px;
+  border-width: 1px;
+  border-color: #4b90ff;
 }
 
 item:selected {
   background: #4b90ff;
   color: #16181c;
+  border-color: #16181c;
 }
 
 label {

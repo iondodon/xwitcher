@@ -18,6 +18,11 @@ const DEFAULT_HORIZONTAL_ITEM_HEIGHT: u16 = 92;
 const DEFAULT_HORIZONTAL_TEXT_OFFSET: i16 = 8;
 const DEFAULT_HORIZONTAL_TEXT_BASELINE: i16 = 82;
 const DEFAULT_HORIZONTAL_CHAR_WIDTH: u16 = 7;
+const DEFAULT_OVERLAY_BORDER_WIDTH: u16 = 0;
+const DEFAULT_OVERLAY_BORDER_COLOR: u32 = 0xFFFFFF;
+const DEFAULT_ITEM_BORDER_WIDTH: u16 = 0;
+const DEFAULT_ITEM_BORDER_COLOR: u32 = 0xFFFFFF;
+const DEFAULT_ITEM_SELECTED_BORDER_COLOR: u32 = 0xFFFFFF;
 
 #[derive(Clone)]
 pub struct Style {
@@ -38,6 +43,11 @@ pub struct Style {
     pub horizontal_text_offset: i16,
     pub horizontal_text_baseline: i16,
     pub horizontal_char_width_estimate: u16,
+    pub overlay_border_width: u16,
+    pub overlay_border_color: u32,
+    pub item_border_width: u16,
+    pub item_border_color: u32,
+    pub item_selected_border_color: u32,
 }
 
 impl Default for Style {
@@ -60,6 +70,11 @@ impl Default for Style {
             horizontal_text_offset: DEFAULT_HORIZONTAL_TEXT_OFFSET,
             horizontal_text_baseline: DEFAULT_HORIZONTAL_TEXT_BASELINE,
             horizontal_char_width_estimate: DEFAULT_HORIZONTAL_CHAR_WIDTH,
+            overlay_border_width: DEFAULT_OVERLAY_BORDER_WIDTH,
+            overlay_border_color: DEFAULT_OVERLAY_BORDER_COLOR,
+            item_border_width: DEFAULT_ITEM_BORDER_WIDTH,
+            item_border_color: DEFAULT_ITEM_BORDER_COLOR,
+            item_selected_border_color: DEFAULT_ITEM_SELECTED_BORDER_COLOR,
         }
     }
 }
@@ -139,6 +154,12 @@ impl Style {
             if let Some(value) = overlay.get("screen-margin") {
                 self.screen_margin = parse_u16_px(value)?;
             }
+            if let Some(value) = overlay.get("border-width") {
+                self.overlay_border_width = parse_u16_px(value)?;
+            }
+            if let Some(value) = overlay.get("border-color") {
+                self.overlay_border_color = parse_color(value)?;
+            }
         }
 
         if let Some(item) = rules.get("item") {
@@ -151,6 +172,12 @@ impl Style {
             if let Some(value) = item.get("icon-margin") {
                 self.icon_margin = parse_u16_px(value)?;
             }
+            if let Some(value) = item.get("border-width") {
+                self.item_border_width = parse_u16_px(value)?;
+            }
+            if let Some(value) = item.get("border-color") {
+                self.item_border_color = parse_color(value)?;
+            }
         }
 
         if let Some(selected) = rules.get("item:selected") {
@@ -159,6 +186,9 @@ impl Style {
             }
             if let Some(value) = selected.get("color") {
                 self.text_selected_color = parse_color(value)?;
+            }
+            if let Some(value) = selected.get("border-color") {
+                self.item_selected_border_color = parse_color(value)?;
             }
         }
 
@@ -219,6 +249,12 @@ impl Style {
                 "--row-height" => self.row_height = parse_u16_px(value)?,
                 "--icon-size" => self.icon_max_size = parse_u16_px(value)?,
                 "--icon-margin" => self.icon_margin = parse_u16_px(value)?,
+                "--overlay-border-width" => {
+                    self.overlay_border_width = parse_u16_px(value)?;
+                }
+                "--overlay-border-color" => {
+                    self.overlay_border_color = parse_color(value)?;
+                }
                 "--vertical-text-gap" => self.vertical_text_gap = parse_i16_px(value)?,
                 "--vertical-text-baseline" => {
                     self.vertical_text_baseline = parse_i16_px(value)?;
@@ -237,6 +273,15 @@ impl Style {
                 }
                 "--horizontal-char-width" => {
                     self.horizontal_char_width_estimate = parse_u16_px(value)?;
+                }
+                "--item-border-width" => {
+                    self.item_border_width = parse_u16_px(value)?;
+                }
+                "--item-border-color" => {
+                    self.item_border_color = parse_color(value)?;
+                }
+                "--item-selected-border-color" => {
+                    self.item_selected_border_color = parse_color(value)?;
                 }
                 _ => {}
             }
