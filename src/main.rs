@@ -1,29 +1,26 @@
-use std::cmp::{max, min, Ordering};
+use anyhow::bail;
+use anyhow::{Context, Result};
+use std::cmp::{Ordering, max, min};
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
-use anyhow::{Context, Result};
 
-use x11::{
-    keysym::{
-        XK_Alt_L, XK_Alt_R, XK_Escape, XK_Tab,
-    },
-};
+use x11::keysym::{XK_Alt_L, XK_Alt_R, XK_Escape, XK_Tab};
 use x11rb::connection::Connection as _;
 use x11rb::protocol::xproto::ConnectionExt as _;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::{
+    CURRENT_TIME, NONE,
     protocol::{
+        Event,
         xproto::{
             Atom, AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent,
             EventMask, Gcontext, GrabMode, ImageFormat, ImageOrder, KeyButMask, KeyPressEvent,
             KeyReleaseEvent, Keycode, MapState, ModMask, PropMode, PropertyNotifyEvent, Rectangle,
             Window, WindowClass,
         },
-        Event,
     },
     rust_connection::RustConnection,
-    CURRENT_TIME, NONE,
 };
 
 const OVERLAY_WIDTH: u16 = 600;
@@ -36,6 +33,72 @@ const ICON_AREA: u16 = ICON_MAX_SIZE + ICON_MARGIN * 2;
 const TEXT_OFFSET: i16 = ICON_AREA as i16 + 8;
 const TEXT_BASELINE: i16 = 34;
 const MAX_ICON_SEARCH_DEPTH: u8 = 5;
+const H_ITEM_WIDTH: u16 = 120;
+const H_ITEM_HEIGHT: u16 = ICON_AREA + 36;
+const H_TEXT_OFFSET: i16 = 8;
+const H_TEXT_BASELINE: i16 = ICON_AREA as i16 + 26;
+const H_CHAR_WIDTH_ESTIMATE: u16 = 7;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum Layout {
+    Horizontal,
+    Vertical,
+}
+
+impl Default for Layout {
+    fn default() -> Self {
+        Layout::Horizontal
+    }
+}
+
+fn parse_layout<I>(args: I) -> Result<Layout>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut layout = Layout::default();
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--horizontal" => layout = Layout::Horizontal,
+            "-v" | "--vertical" => layout = Layout::Vertical,
+            other => bail!("unknown option: {other}"),
+        }
+    }
+    Ok(layout)
+}
+
+fn fit_horizontal_label(title: &str, cell_width: u16) -> (String, u16) {
+    let sanitized = sanitize_ascii(title);
+    if sanitized.is_empty() {
+        return (sanitized, 0);
+    }
+
+    let margin = (H_TEXT_OFFSET as u16) * 2;
+    if cell_width <= margin {
+        return (String::new(), 0);
+    }
+
+    let available = cell_width.saturating_sub(margin);
+    let mut max_chars = usize::from(available) / usize::from(H_CHAR_WIDTH_ESTIMATE);
+    if max_chars == 0 {
+        max_chars = 1;
+    }
+
+    let mut label = sanitized;
+    if label.len() > max_chars {
+        if max_chars <= 3 {
+            label = ".".repeat(max_chars);
+        } else {
+            let keep = max_chars - 3;
+            label.truncate(keep);
+            label.push_str("...");
+        }
+    }
+
+    let approx_width = (label.len() as u16)
+        .saturating_mul(H_CHAR_WIDTH_ESTIMATE)
+        .min(available);
+    (label, approx_width)
+}
 
 #[allow(non_snake_case)]
 struct Atoms {
@@ -61,7 +124,10 @@ impl Atoms {
             _NET_WM_NAME: intern_atom(conn, "_NET_WM_NAME")?,
             _NET_WM_VISIBLE_NAME: intern_atom(conn, "_NET_WM_VISIBLE_NAME")?,
             _NET_WM_WINDOW_TYPE: intern_atom(conn, "_NET_WM_WINDOW_TYPE")?,
-            _NET_WM_WINDOW_TYPE_NOTIFICATION: intern_atom(conn, "_NET_WM_WINDOW_TYPE_NOTIFICATION")?,
+            _NET_WM_WINDOW_TYPE_NOTIFICATION: intern_atom(
+                conn,
+                "_NET_WM_WINDOW_TYPE_NOTIFICATION",
+            )?,
             _NET_WM_ICON: intern_atom(conn, "_NET_WM_ICON")?,
             UTF8_STRING: intern_atom(conn, "UTF8_STRING")?,
             WM_CLASS: intern_atom(conn, "WM_CLASS")?,
@@ -71,9 +137,10 @@ impl Atoms {
 }
 
 fn main() -> Result<()> {
+    let layout = parse_layout(env::args().skip(1))?;
     let (conn, screen_num) = x11rb::connect(None).context("failed to connect to X server")?;
     let atoms = Atoms::new(&conn).context("failed to intern atoms")?;
-    let mut app = AltTab::new(conn, screen_num, atoms)?;
+    let mut app = AltTab::new(conn, screen_num, atoms, layout)?;
     app.run()
 }
 
@@ -81,6 +148,7 @@ struct AltTab {
     conn: RustConnection,
     screen_num: usize,
     atoms: Atoms,
+    layout: Layout,
     bindings: KeyBindings,
     state: Option<OverlayState>,
     icon_theme: IconTheme,
@@ -88,12 +156,13 @@ struct AltTab {
 }
 
 impl AltTab {
-    fn new(conn: RustConnection, screen_num: usize, atoms: Atoms) -> Result<Self> {
+    fn new(conn: RustConnection, screen_num: usize, atoms: Atoms, layout: Layout) -> Result<Self> {
         let bindings = KeyBindings::load(&conn)?;
         let mut app = Self {
             conn,
             screen_num,
             atoms,
+            layout,
             bindings,
             state: None,
             icon_theme: IconTheme::new(),
@@ -107,7 +176,11 @@ impl AltTab {
 
     fn run(&mut self) -> Result<()> {
         loop {
-            match self.conn.wait_for_event().context("failed waiting for X event")? {
+            match self
+                .conn
+                .wait_for_event()
+                .context("failed waiting for X event")?
+            {
                 Event::KeyPress(event) => self.handle_key_press(event)?,
                 Event::KeyRelease(event) => self.handle_key_release(event)?,
                 Event::MappingNotify(_event) => {
@@ -146,8 +219,7 @@ impl AltTab {
                 return Ok(());
             }
             if self.bindings.is_tab(event.detail) {
-                let shift_down =
-                    (u16::from(event.state) & u16::from(KeyButMask::SHIFT)) != 0;
+                let shift_down = (u16::from(event.state) & u16::from(KeyButMask::SHIFT)) != 0;
                 let direction = if shift_down {
                     Direction::Backward
                 } else {
@@ -169,8 +241,7 @@ impl AltTab {
         if self.bindings.is_tab(event.detail)
             && (u16::from(event.state) & u16::from(KeyButMask::MOD1)) != 0
         {
-            let shift_down =
-                (u16::from(event.state) & u16::from(KeyButMask::SHIFT)) != 0;
+            let shift_down = (u16::from(event.state) & u16::from(KeyButMask::SHIFT)) != 0;
             let direction = if shift_down {
                 Direction::Backward
             } else {
@@ -264,7 +335,7 @@ impl AltTab {
             }
         }
 
-        let overlay = self.create_overlay(entries.len())?;
+        let overlay = self.create_overlay(self.layout, entries.len())?;
         let mut state = OverlayState::new(entries, overlay);
         if state.windows.len() > 1 {
             state.advance(direction);
@@ -317,59 +388,125 @@ impl AltTab {
             state.overlay.height,
         )?;
 
-        let visible = state.visible_range();
-        for (idx, window_index) in visible.enumerate() {
-            let entry = &state.windows[window_index];
-            let rect_y = PADDING as i16 + (idx as i16) * ROW_HEIGHT as i16;
-            let rect = Rectangle {
-                x: PADDING as i16,
-                y: rect_y,
-                width: state.overlay.width - 2 * PADDING,
-                height: ROW_HEIGHT,
-            };
+        match state.overlay.layout {
+            Layout::Vertical => {
+                for (idx, window_index) in state.visible_range().enumerate() {
+                    let entry = &state.windows[window_index];
+                    let rect_y = PADDING as i16 + (idx as i16) * ROW_HEIGHT as i16;
+                    let rect = Rectangle {
+                        x: PADDING as i16,
+                        y: rect_y,
+                        width: state.overlay.width.saturating_sub(2 * PADDING),
+                        height: ROW_HEIGHT,
+                    };
 
-            let is_selected = window_index == state.current;
-            if is_selected {
-                self.conn.poly_fill_rectangle(
-                    state.overlay.window,
-                    state.overlay.highlight_gc,
-                    &[rect],
-                )?;
+                    let is_selected = window_index == state.current;
+                    if is_selected {
+                        self.conn.poly_fill_rectangle(
+                            state.overlay.window,
+                            state.overlay.highlight_gc,
+                            &[rect],
+                        )?;
+                    }
+
+                    if let Some(icon) = &entry.icon {
+                        let icon_x = rect.x + ICON_MARGIN as i16;
+                        let icon_y = rect.y + max(0, (ROW_HEIGHT as i16 - icon.height as i16) / 2);
+                        self.draw_icon(&state.overlay, icon, icon_x, icon_y, is_selected)?;
+                    }
+
+                    let gc = if is_selected {
+                        state.overlay.selected_text_gc
+                    } else {
+                        state.overlay.text_gc
+                    };
+
+                    self.draw_text(
+                        state.overlay.window,
+                        gc,
+                        rect.x + TEXT_OFFSET,
+                        rect.y + TEXT_BASELINE,
+                        &entry.title,
+                    )?;
+                }
             }
+            Layout::Horizontal => {
+                let capacity = max(1, state.overlay.visible_capacity);
+                let available_width = state.overlay.width.saturating_sub(PADDING * 2);
+                let mut cell_width_u32 = u32::from(H_ITEM_WIDTH);
+                let available_width_u32 = u32::from(available_width);
+                if cell_width_u32 * capacity as u32 > available_width_u32 {
+                    cell_width_u32 = max(1, available_width_u32 / capacity as u32);
+                }
+                let cell_width = cell_width_u32 as u16;
+                let cell_height = max(ICON_AREA, state.overlay.height.saturating_sub(PADDING * 2));
+                let total_items_width = cell_width_u32 * capacity as u32;
+                let extra_space = available_width_u32.saturating_sub(total_items_width);
+                let leading_offset = PADDING as i16 + (extra_space / 2) as i16;
 
-            if let Some(icon) = &entry.icon {
-                let icon_x = rect.x + ICON_MARGIN as i16;
-                let icon_y = rect.y
-                    + ((ROW_HEIGHT as i16 - icon.height as i16) / 2).max(0);
-                self.draw_icon(&state.overlay, icon, icon_x, icon_y, is_selected)?;
+                for (idx, window_index) in state.visible_range().enumerate() {
+                    let entry = &state.windows[window_index];
+                    let cell_x = leading_offset + (idx as u32 * cell_width_u32) as i16;
+                    let rect = Rectangle {
+                        x: cell_x,
+                        y: PADDING as i16,
+                        width: cell_width,
+                        height: cell_height,
+                    };
+
+                    let is_selected = window_index == state.current;
+                    if is_selected {
+                        self.conn.poly_fill_rectangle(
+                            state.overlay.window,
+                            state.overlay.highlight_gc,
+                            &[rect],
+                        )?;
+                    }
+
+                    if let Some(icon) = &entry.icon {
+                        let icon_x =
+                            cell_x + max(0, (cell_width as i32 - icon.width as i32) / 2) as i16;
+                        let icon_y = PADDING as i16
+                            + max(0, (ICON_AREA as i32 - icon.height as i32) / 2) as i16;
+                        self.draw_icon(&state.overlay, icon, icon_x, icon_y, is_selected)?;
+                    }
+
+                    let gc = if is_selected {
+                        state.overlay.selected_text_gc
+                    } else {
+                        state.overlay.text_gc
+                    };
+
+                    let (label, approx_width) = fit_horizontal_label(&entry.title, cell_width);
+                    if !label.is_empty() && approx_width > 0 {
+                        let centered_offset =
+                            ((cell_width as i32 - i32::from(approx_width)) / 2).max(0) as i16;
+                        let mut text_x = cell_x + centered_offset;
+                        let min_x = cell_x + H_TEXT_OFFSET;
+                        if text_x < min_x {
+                            text_x = min_x;
+                        }
+                        let max_x = cell_x + cell_width as i16 - H_TEXT_OFFSET;
+                        if text_x > max_x {
+                            text_x = max_x;
+                        }
+
+                        self.draw_text(
+                            state.overlay.window,
+                            gc,
+                            text_x,
+                            PADDING as i16 + H_TEXT_BASELINE,
+                            &label,
+                        )?;
+                    }
+                }
             }
-
-            let gc = if is_selected {
-                state.overlay.selected_text_gc
-            } else {
-                state.overlay.text_gc
-            };
-
-            self.draw_text(
-                state.overlay.window,
-                gc,
-                rect.x + TEXT_OFFSET,
-                rect.y + TEXT_BASELINE,
-                &entry.title,
-            )?;
         }
         self.conn.flush()?;
         Ok(())
     }
 
-    fn draw_text(
-        &self,
-        window: Window,
-        gc: Gcontext,
-        x: i16,
-        y: i16,
-        text: &str,
-    ) -> Result<()> {
+    fn draw_text(&self, window: Window, gc: Gcontext, x: i16, y: i16, text: &str) -> Result<()> {
         let ascii = sanitize_ascii(text);
         let bytes = ascii.as_bytes();
         let truncated = if bytes.len() > u8::MAX as usize {
@@ -397,10 +534,7 @@ impl AltTab {
 
         let width = icon.width;
         let height = icon.height;
-        let little_endian = matches!(
-            self.conn.setup().image_byte_order,
-            ImageOrder::LSB_FIRST
-        );
+        let little_endian = matches!(self.conn.setup().image_byte_order, ImageOrder::LSB_FIRST);
         let depth = self.screen().root_depth;
         let format = self
             .conn
@@ -485,24 +619,63 @@ impl AltTab {
         Ok(())
     }
 
-    fn create_overlay(&self, row_count: usize) -> Result<OverlayWindow> {
+    fn create_overlay(&self, layout: Layout, item_count: usize) -> Result<OverlayWindow> {
         let screen = self.screen();
-        let width = min(OVERLAY_WIDTH, screen.width_in_pixels);
-        let mut full_height = PADDING * 2 + (row_count as u16) * ROW_HEIGHT;
-        let max_height = screen
-            .height_in_pixels
-            .saturating_sub(SCREEN_MARGIN);
-        if max_height > 0 {
-            full_height = min(full_height, max_height);
-        }
-        let height = max(full_height, PADDING * 2 + ROW_HEIGHT);
-        let visible_rows =
-            max(1, ((height.saturating_sub(PADDING * 2)) / ROW_HEIGHT) as usize);
+        let (width, height, visible_capacity) = match layout {
+            Layout::Vertical => {
+                let width = min(OVERLAY_WIDTH, screen.width_in_pixels);
+                let mut full_height = PADDING * 2 + (item_count as u16) * ROW_HEIGHT;
+                let max_height = screen.height_in_pixels.saturating_sub(SCREEN_MARGIN);
+                if max_height > 0 {
+                    full_height = min(full_height, max_height);
+                }
+                let height = max(full_height, PADDING * 2 + ROW_HEIGHT);
+                let visible_rows = max(
+                    1,
+                    ((height.saturating_sub(PADDING * 2)) / ROW_HEIGHT) as usize,
+                );
+                (width, height, visible_rows)
+            }
+            Layout::Horizontal => {
+                let screen_width = screen.width_in_pixels;
+                let width_limit = if screen_width > SCREEN_MARGIN {
+                    screen_width - SCREEN_MARGIN
+                } else {
+                    screen_width
+                };
+                let available_for_cols = width_limit.saturating_sub(PADDING * 2);
+                let max_cols = max(1, (available_for_cols / H_ITEM_WIDTH) as usize);
+                let effective_count = max(1, item_count);
+                let visible_cols = min(max_cols, effective_count);
 
-        let x = ((screen.width_in_pixels - width) / 2) as i16;
-        let y = ((screen.height_in_pixels - height) / 2) as i16;
+                let mut width =
+                    (u32::from(PADDING) * 2) + u32::from(H_ITEM_WIDTH) * visible_cols as u32;
+                let screen_width_u32 = u32::from(screen_width);
+                if width > screen_width_u32 {
+                    width = screen_width_u32;
+                }
 
-        let window = self.conn.generate_id().context("failed to alloc window id")?;
+                let mut height = (u32::from(PADDING) * 2) + u32::from(H_ITEM_HEIGHT);
+                let max_height = screen.height_in_pixels.saturating_sub(SCREEN_MARGIN);
+                if max_height > 0 {
+                    height = min(height, u32::from(max_height));
+                }
+                let min_height = (u32::from(PADDING) * 2) + u32::from(ICON_AREA);
+                if height < min_height {
+                    height = min_height;
+                }
+
+                (width as u16, height as u16, visible_cols)
+            }
+        };
+
+        let x = ((screen.width_in_pixels.saturating_sub(width)) / 2) as i16;
+        let y = ((screen.height_in_pixels.saturating_sub(height)) / 2) as i16;
+
+        let window = self
+            .conn
+            .generate_id()
+            .context("failed to alloc window id")?;
         self.conn
             .create_window(
                 x11rb::COPY_DEPTH_FROM_PARENT,
@@ -558,7 +731,8 @@ impl AltTab {
             icon_gc,
             width,
             height,
-            visible_rows,
+            layout,
+            visible_capacity,
         })
     }
 
@@ -610,7 +784,11 @@ impl AltTab {
                 let class_names = self.window_class_names(window)?;
                 icon = self.icon_theme.lookup(&class_names)?;
             }
-            result.push(WindowEntry { window, title, icon });
+            result.push(WindowEntry {
+                window,
+                title,
+                icon,
+            });
         }
         self.apply_mru_order(&mut result);
         Ok(result)
@@ -735,14 +913,9 @@ impl AltTab {
     }
 
     fn get_utf8_property(&self, window: Window, atom: u32) -> Result<Option<String>> {
-        let cookie = self.conn.get_property(
-            false,
-            window,
-            atom,
-            self.atoms.UTF8_STRING,
-            0,
-            1024,
-        )?;
+        let cookie =
+            self.conn
+                .get_property(false, window, atom, self.atoms.UTF8_STRING, 0, 1024)?;
         let reply = match cookie.reply() {
             Ok(rep) => rep,
             Err(_) => return Ok(None),
@@ -807,13 +980,7 @@ impl AltTab {
 
     fn focus_window(&self, window: Window) -> Result<()> {
         let root = self.screen().root;
-        let data = ClientMessageData::from([
-            1,
-            CURRENT_TIME,
-            window,
-            0,
-            0,
-        ]);
+        let data = ClientMessageData::from([1, CURRENT_TIME, window, 0, 0]);
         let event = ClientMessageEvent {
             response_type: x11rb::protocol::xproto::CLIENT_MESSAGE_EVENT,
             format: 32,
@@ -823,12 +990,13 @@ impl AltTab {
             data,
         };
 
-        let mask =
-            EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY;
+        let mask = EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY;
         let _ = self.conn.send_event(false, root, mask, event);
-        let _ = self
-            .conn
-            .set_input_focus(x11rb::protocol::xproto::InputFocus::POINTER_ROOT, window, CURRENT_TIME);
+        let _ = self.conn.set_input_focus(
+            x11rb::protocol::xproto::InputFocus::POINTER_ROOT,
+            window,
+            CURRENT_TIME,
+        );
         self.conn.flush()?;
         Ok(())
     }
@@ -840,9 +1008,14 @@ impl AltTab {
             for mask in &ignore_masks {
                 let mods = *mask | ModMask::M1;
                 let mods_rev = *mask | ModMask::M1 | ModMask::SHIFT;
-                let _ = self
-                    .conn
-                    .grab_key(false, root, mods, *keycode, GrabMode::ASYNC, GrabMode::ASYNC);
+                let _ = self.conn.grab_key(
+                    false,
+                    root,
+                    mods,
+                    *keycode,
+                    GrabMode::ASYNC,
+                    GrabMode::ASYNC,
+                );
                 let _ = self.conn.grab_key(
                     false,
                     root,
@@ -1012,7 +1185,8 @@ struct OverlayWindow {
     icon_gc: Gcontext,
     width: u16,
     height: u16,
-    visible_rows: usize,
+    layout: Layout,
+    visible_capacity: usize,
 }
 
 struct OverlayState {
@@ -1054,18 +1228,17 @@ impl OverlayState {
     }
 
     fn ensure_visible(&mut self) {
+        let capacity = max(1, self.overlay.visible_capacity);
         if self.current < self.first_visible {
             self.first_visible = self.current;
-        } else if self.current >= self.first_visible + self.overlay.visible_rows {
-            self.first_visible = self.current + 1 - self.overlay.visible_rows;
+        } else if self.current >= self.first_visible + capacity {
+            self.first_visible = self.current + 1 - capacity;
         }
     }
 
     fn visible_range(&self) -> impl Iterator<Item = usize> {
-        let end = min(
-            self.windows.len(),
-            self.first_visible + self.overlay.visible_rows,
-        );
+        let capacity = max(1, self.overlay.visible_capacity);
+        let end = min(self.windows.len(), self.first_visible + capacity);
         self.first_visible..end
     }
 
@@ -1199,10 +1372,7 @@ fn parse_wm_icon(data: &[u32]) -> Option<Icon> {
 
         let max_dim = width.max(height);
         if width <= target && height <= target {
-            let best_dim = best
-                .as_ref()
-                .map(|(w, h, _)| (*w).max(*h))
-                .unwrap_or(0);
+            let best_dim = best.as_ref().map(|(w, h, _)| (*w).max(*h)).unwrap_or(0);
             if max_dim > best_dim {
                 best = Some((width, height, pixels));
             }
@@ -1234,7 +1404,11 @@ fn build_desktop_index() -> Result<HashMap<String, Vec<IconSource>>> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()).map_or(true, |ext| ext != "desktop") {
+            if path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map_or(true, |ext| ext != "desktop")
+            {
                 continue;
             }
             if let Some((keys, source)) = parse_desktop_file(&path) {
@@ -1266,7 +1440,12 @@ fn desktop_entry_dirs() -> Vec<PathBuf> {
 
     let data_dirs = env::var("XDG_DATA_DIRS")
         .map(|dirs| dirs.split(':').map(PathBuf::from).collect::<Vec<_>>())
-        .unwrap_or_else(|_| vec![PathBuf::from("/usr/local/share"), PathBuf::from("/usr/share")]);
+        .unwrap_or_else(|_| {
+            vec![
+                PathBuf::from("/usr/local/share"),
+                PathBuf::from("/usr/share"),
+            ]
+        });
     for dir in data_dirs {
         let apps = dir.join("applications");
         if apps.is_dir() {
@@ -1414,13 +1593,11 @@ fn icon_search_roots() -> Vec<PathBuf> {
         }
     }
 
-    let data_home = env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .map(|home| home.join(".local").join("share"))
-        });
+    let data_home = env::var_os("XDG_DATA_HOME").map(PathBuf::from).or_else(|| {
+        env::var_os("HOME")
+            .map(PathBuf::from)
+            .map(|home| home.join(".local").join("share"))
+    });
     if let Some(dir) = data_home {
         let icons_dir = dir.join("icons");
         if icons_dir.is_dir() {
@@ -1430,7 +1607,12 @@ fn icon_search_roots() -> Vec<PathBuf> {
 
     let data_dirs = env::var("XDG_DATA_DIRS")
         .map(|dirs| dirs.split(':').map(PathBuf::from).collect::<Vec<_>>())
-        .unwrap_or_else(|_| vec![PathBuf::from("/usr/local/share"), PathBuf::from("/usr/share")]);
+        .unwrap_or_else(|_| {
+            vec![
+                PathBuf::from("/usr/local/share"),
+                PathBuf::from("/usr/share"),
+            ]
+        });
     for dir in data_dirs {
         let icons_dir = dir.join("icons");
         if icons_dir.is_dir() {

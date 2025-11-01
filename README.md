@@ -40,6 +40,17 @@ xwitcher &
 
 The process grabs the keyboard when `Alt`+`Tab` is pressed and keeps running in the background. Press `Ctrl+C` in the launching terminal or kill the process to stop it.
 
+### Layout options
+
+The overlay shows icons in a horizontal strip with labels underneath by default. You can force a specific layout when launching the binary:
+
+```bash
+xwitcher --horizontal  # explicit horizontal layout (default)
+xwitcher --vertical    # stack entries vertically
+```
+
+Short aliases `-h` and `-v` are also supported.
+
 ## Keyboard behaviour
 
 - `Alt+Tab`: cycle forward through the window list.
