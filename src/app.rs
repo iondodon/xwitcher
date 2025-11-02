@@ -89,6 +89,27 @@ impl AltTab {
                         }
                     }
                 }
+                Event::MotionNotify(event) => {
+                    self.update_hover_from_pointer(event.event, event.event_x, event.event_y)?;
+                }
+                Event::EnterNotify(event) => {
+                    self.update_hover_from_pointer(event.event, event.event_x, event.event_y)?;
+                }
+                Event::LeaveNotify(event) => {
+                    self.clear_hover_from_pointer(event.event)?;
+                }
+                Event::ButtonPress(event) => {
+                    self.update_hover_from_pointer(event.event, event.event_x, event.event_y)?;
+                }
+                Event::ButtonRelease(event) => {
+                    if event.detail == 1 {
+                        self.activate_selection_from_pointer(
+                            event.event,
+                            event.event_x,
+                            event.event_y,
+                        )?;
+                    }
+                }
                 Event::PropertyNotify(event) => self.handle_property_notify(event)?,
                 _ => {}
             }
@@ -276,6 +297,11 @@ impl AltTab {
             &[background_rect],
         )?;
 
+        let hover_color = Self::blend_colors(
+            self.style.overlay_background,
+            self.style.highlight_background,
+        );
+
         match state.overlay.layout {
             Layout::Vertical => {
                 let padding = self.style.padding as i16;
@@ -293,10 +319,24 @@ impl AltTab {
                     };
 
                     let is_selected = window_index == state.current;
+                    let is_hovered = state.hovered == Some(window_index);
+                    let item_background = if is_selected {
+                        self.style.highlight_background
+                    } else if is_hovered {
+                        hover_color
+                    } else {
+                        self.style.overlay_background
+                    };
                     if is_selected {
                         self.conn.poly_fill_rectangle(
                             state.overlay.window,
                             state.overlay.highlight_gc,
+                            &[rect],
+                        )?;
+                    } else if is_hovered {
+                        self.conn.poly_fill_rectangle(
+                            state.overlay.window,
+                            state.overlay.hover_gc,
                             &[rect],
                         )?;
                     }
@@ -304,7 +344,7 @@ impl AltTab {
                     if let Some(icon) = &entry.icon {
                         let icon_x = rect.x + self.style.icon_margin as i16;
                         let icon_y = rect.y + max(0, (row_height as i16 - icon.height as i16) / 2);
-                        self.draw_icon(&state.overlay, icon, icon_x, icon_y, is_selected)?;
+                        self.draw_icon(&state.overlay, icon, icon_x, icon_y, item_background)?;
                     }
 
                     if self.style.item_border_width > 0 {
@@ -328,6 +368,8 @@ impl AltTab {
 
                     let gc = if is_selected {
                         state.overlay.selected_text_gc
+                    } else if is_hovered {
+                        state.overlay.hover_text_gc
                     } else {
                         state.overlay.text_gc
                     };
@@ -368,10 +410,24 @@ impl AltTab {
                     };
 
                     let is_selected = window_index == state.current;
+                    let is_hovered = state.hovered == Some(window_index);
+                    let item_background = if is_selected {
+                        self.style.highlight_background
+                    } else if is_hovered {
+                        hover_color
+                    } else {
+                        self.style.overlay_background
+                    };
                     if is_selected {
                         self.conn.poly_fill_rectangle(
                             state.overlay.window,
                             state.overlay.highlight_gc,
+                            &[rect],
+                        )?;
+                    } else if is_hovered {
+                        self.conn.poly_fill_rectangle(
+                            state.overlay.window,
+                            state.overlay.hover_gc,
                             &[rect],
                         )?;
                     }
@@ -381,7 +437,7 @@ impl AltTab {
                             cell_x + max(0, (cell_width as i32 - icon.width as i32) / 2) as i16;
                         let icon_y = padding as i16
                             + max(0, (icon_area as i32 - icon.height as i32) / 2) as i16;
-                        self.draw_icon(&state.overlay, icon, icon_x, icon_y, is_selected)?;
+                        self.draw_icon(&state.overlay, icon, icon_x, icon_y, item_background)?;
                     }
 
                     if self.style.item_border_width > 0 {
@@ -405,6 +461,8 @@ impl AltTab {
 
                     let gc = if is_selected {
                         state.overlay.selected_text_gc
+                    } else if is_hovered {
+                        state.overlay.hover_text_gc
                     } else {
                         state.overlay.text_gc
                     };
@@ -456,6 +514,150 @@ impl AltTab {
         Ok(())
     }
 
+    fn update_hover_from_pointer(&mut self, window: Window, x: i16, y: i16) -> Result<()> {
+        let hover_index = match self.state.as_ref() {
+            Some(state) if state.overlay.window == window => {
+                self.item_index_at_position(state, x, y)
+            }
+            _ => return Ok(()),
+        };
+
+        if let Some(state) = self.state.as_mut() {
+            if state.set_hovered(hover_index) {
+                self.redraw_overlay()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn activate_selection_from_pointer(&mut self, window: Window, x: i16, y: i16) -> Result<()> {
+        let index = match self.state.as_ref() {
+            Some(state) if state.overlay.window == window => {
+                self.item_index_at_position(state, x, y)
+            }
+            _ => return Ok(()),
+        };
+
+        if let Some(index) = index {
+            if let Some(state) = self.state.as_mut() {
+                state.set_current(index);
+            }
+            self.finish_selection(true)?;
+        }
+        Ok(())
+    }
+
+    fn clear_hover_from_pointer(&mut self, window: Window) -> Result<()> {
+        if let Some(state) = self.state.as_mut() {
+            if state.overlay.window == window {
+                if state.set_hovered(None) {
+                    self.redraw_overlay()?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn item_index_at_position(&self, state: &OverlayState, x: i16, y: i16) -> Option<usize> {
+        match state.overlay.layout {
+            Layout::Vertical => {
+                let padding = self.style.padding as i16;
+                let row_height = self.style.row_height;
+                if row_height == 0 {
+                    return None;
+                }
+                let width = state
+                    .overlay
+                    .width
+                    .saturating_sub(self.style.padding.saturating_mul(2));
+
+                for (slot, window_index) in state.visible_range().enumerate() {
+                    let rect_y = padding + (slot as i16) * row_height as i16;
+                    let rect = Rectangle {
+                        x: padding,
+                        y: rect_y,
+                        width,
+                        height: row_height,
+                    };
+                    if Self::rect_contains(&rect, x, y) {
+                        return Some(window_index);
+                    }
+                }
+                None
+            }
+            Layout::Horizontal => {
+                let capacity = max(1, state.overlay.visible_capacity);
+                let padding = self.style.padding;
+                let available_width = state
+                    .overlay
+                    .width
+                    .saturating_sub(padding.saturating_mul(2));
+                let mut cell_width_u32 = u32::from(self.style.horizontal_item_width.max(1));
+                let available_width_u32 = u32::from(available_width);
+                if cell_width_u32 * capacity as u32 > available_width_u32 && available_width_u32 > 0
+                {
+                    cell_width_u32 = max(1, available_width_u32 / capacity as u32);
+                }
+                let cell_width = cell_width_u32 as u16;
+                if cell_width == 0 {
+                    return None;
+                }
+
+                let icon_area = self.style.icon_area();
+                let cell_height = max(
+                    icon_area,
+                    state
+                        .overlay
+                        .height
+                        .saturating_sub(padding.saturating_mul(2)),
+                );
+                let total_items_width = cell_width_u32 * capacity as u32;
+                let extra_space = available_width_u32.saturating_sub(total_items_width);
+                let leading_offset = padding as i16 + (extra_space / 2) as i16;
+
+                for (slot, window_index) in state.visible_range().enumerate() {
+                    let cell_x = leading_offset + (slot as u32 * cell_width_u32) as i16;
+                    let rect = Rectangle {
+                        x: cell_x,
+                        y: padding as i16,
+                        width: cell_width,
+                        height: cell_height,
+                    };
+                    if Self::rect_contains(&rect, x, y) {
+                        return Some(window_index);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    fn rect_contains(rect: &Rectangle, x: i16, y: i16) -> bool {
+        let px = i32::from(x);
+        let py = i32::from(y);
+        let rx1 = i32::from(rect.x);
+        let ry1 = i32::from(rect.y);
+        let rx2 = rx1 + i32::from(rect.width);
+        let ry2 = ry1 + i32::from(rect.height);
+        px >= rx1 && px < rx2 && py >= ry1 && py < ry2
+    }
+
+    fn blend_colors(a: u32, b: u32) -> u32 {
+        let ar = (a >> 16) & 0xff;
+        let ag = (a >> 8) & 0xff;
+        let ab = a & 0xff;
+
+        let br = (b >> 16) & 0xff;
+        let bg = (b >> 8) & 0xff;
+        let bb = b & 0xff;
+
+        let r = ((ar + br) / 2) & 0xff;
+        let g = ((ag + bg) / 2) & 0xff;
+        let blue = ((ab + bb) / 2) & 0xff;
+
+        (r << 16) | (g << 8) | blue
+    }
+
     fn draw_text(&self, window: Window, gc: Gcontext, x: i16, y: i16, text: &str) -> Result<()> {
         let ascii = sanitize_ascii(text);
         let bytes = ascii.as_bytes();
@@ -476,7 +678,7 @@ impl AltTab {
         icon: &Icon,
         x: i16,
         y: i16,
-        selected: bool,
+        background: u32,
     ) -> Result<()> {
         if icon.pixels.is_empty() {
             return Ok(());
@@ -499,14 +701,9 @@ impl AltTab {
         let row_stride = ((width as usize * bytes_per_pixel + pad - 1) / pad) * pad;
         let mut data = vec![0u8; row_stride * height as usize];
 
-        let bg = if selected {
-            self.style.highlight_background
-        } else {
-            self.style.overlay_background
-        };
-        let bg_r = ((bg >> 16) & 0xff) as u32;
-        let bg_g = ((bg >> 8) & 0xff) as u32;
-        let bg_b = (bg & 0xff) as u32;
+        let bg_r = ((background >> 16) & 0xff) as u32;
+        let bg_g = ((background >> 8) & 0xff) as u32;
+        let bg_b = (background & 0xff) as u32;
 
         for row in 0..height as usize {
             for col in 0..width as usize {
@@ -595,7 +792,9 @@ impl AltTab {
     fn destroy_overlay(&self, overlay: &OverlayWindow) -> Result<()> {
         let _ = self.conn.free_gc(overlay.text_gc);
         let _ = self.conn.free_gc(overlay.selected_text_gc);
+        let _ = self.conn.free_gc(overlay.hover_text_gc);
         let _ = self.conn.free_gc(overlay.highlight_gc);
+        let _ = self.conn.free_gc(overlay.hover_gc);
         let _ = self.conn.free_gc(overlay.background_gc);
         let _ = self.conn.free_gc(overlay.icon_gc);
         if let Some(gc) = overlay.border_gc {
@@ -700,7 +899,14 @@ impl AltTab {
                 0,
                 &CreateWindowAux::new()
                     .background_pixel(screen.black_pixel)
-                    .event_mask(EventMask::EXPOSURE),
+                    .event_mask(
+                        EventMask::EXPOSURE
+                            | EventMask::BUTTON_PRESS
+                            | EventMask::BUTTON_RELEASE
+                            | EventMask::POINTER_MOTION
+                            | EventMask::ENTER_WINDOW
+                            | EventMask::LEAVE_WINDOW,
+                    ),
             )
             .context("failed to create overlay window")?;
 
@@ -728,6 +934,11 @@ impl AltTab {
 
         self.conn.map_window(window)?;
 
+        let hover_color = Self::blend_colors(
+            self.style.overlay_background,
+            self.style.highlight_background,
+        );
+
         let background_gc = self.create_gc(
             window,
             self.style.overlay_background,
@@ -735,6 +946,7 @@ impl AltTab {
         )?;
         let text_gc =
             self.create_gc(window, self.style.text_color, self.style.overlay_background)?;
+        let hover_text_gc = self.create_gc(window, self.style.text_color, hover_color)?;
         let selected_text_gc = self.create_gc(
             window,
             self.style.text_selected_color,
@@ -745,6 +957,7 @@ impl AltTab {
             self.style.highlight_background,
             self.style.highlight_background,
         )?;
+        let hover_gc = self.create_gc(window, hover_color, self.style.overlay_background)?;
         let icon_gc = self.create_gc(
             window,
             self.style.overlay_background,
@@ -773,7 +986,9 @@ impl AltTab {
             window,
             text_gc,
             selected_text_gc,
+            hover_text_gc,
             highlight_gc,
+            hover_gc,
             background_gc,
             icon_gc,
             border_gc,

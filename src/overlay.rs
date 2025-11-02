@@ -13,7 +13,9 @@ pub struct OverlayWindow {
     pub window: Window,
     pub text_gc: Gcontext,
     pub selected_text_gc: Gcontext,
+    pub hover_text_gc: Gcontext,
     pub highlight_gc: Gcontext,
+    pub hover_gc: Gcontext,
     pub background_gc: Gcontext,
     pub icon_gc: Gcontext,
     pub border_gc: Option<Gcontext>,
@@ -31,6 +33,7 @@ pub struct OverlayState {
     pub first_visible: usize,
     pub overlay: OverlayWindow,
     pub alt_count: usize,
+    pub hovered: Option<usize>,
 }
 
 impl OverlayState {
@@ -41,6 +44,7 @@ impl OverlayState {
             first_visible: 0,
             overlay,
             alt_count: 0,
+            hovered: None,
         }
     }
 
@@ -63,6 +67,18 @@ impl OverlayState {
         self.ensure_visible();
     }
 
+    pub fn set_current(&mut self, index: usize) -> bool {
+        if self.windows.is_empty() || index >= self.windows.len() {
+            return false;
+        }
+        if self.current == index {
+            return false;
+        }
+        self.current = index;
+        self.ensure_visible();
+        true
+    }
+
     pub fn ensure_visible(&mut self) {
         let capacity = max(1, self.overlay.visible_capacity);
         if self.current < self.first_visible {
@@ -70,6 +86,15 @@ impl OverlayState {
         } else if self.current >= self.first_visible + capacity {
             self.first_visible = self.current + 1 - capacity;
         }
+    }
+
+    pub fn set_hovered(&mut self, hovered: Option<usize>) -> bool {
+        let clamped = hovered.filter(|idx| *idx < self.windows.len());
+        if clamped == self.hovered {
+            return false;
+        }
+        self.hovered = clamped;
+        true
     }
 
     pub fn visible_range(&self) -> impl Iterator<Item = usize> {
