@@ -1,3 +1,5 @@
+⚠️ This app is Vibe Coded.
+
 # xwitcher
 
 xwitcher is a lightweight Alt+Tab replacement for X11 written in Rust. It grabs the classic `Alt+Tab` key sequence, shows a custom overlay listing open windows, and lets you pick a target while keeping your most recently used applications at the top. The project focuses on being self-contained, fast, and visually clean while still showing window icons and titles sourced from EWMH metadata or your desktop icon themes.
